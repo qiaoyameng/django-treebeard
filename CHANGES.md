@@ -1,3 +1,16 @@
+Release 7.0.3 (unreleased)
+---------------------------
+
+- Added `MP_NodeQuerySet.annotate_ancestor_value()` (also available on the
+  manager) to annotate each node with a field value taken from the nearest
+  ancestor that defines it, including the node itself. A defined value of
+  `NULL` explicitly clears inherited values; step boundaries are always
+  respected when matching ancestors. The annotations use correlated
+  subqueries so the query count stays fixed regardless of tree size, work with
+  filtered, ordered and paginated querysets, multiple root trees and database
+  aliases, and never leak the target queryset's filters into the ancestor
+  lookup.
+
 Release 7.0.2 (Sep 15, 2026)
 ----------------------------
 

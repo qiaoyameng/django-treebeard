@@ -255,3 +255,12 @@ if os.environ.get("DATABASE_ENGINE", "") == "psql":
     INHERITED_MODELS_WITH_SORT.append((LT_TestNodeSorted, LT_TestNodeInheritedSorted))
     LT_BASE_MODELS.append(LT_TestNode)
     BENCHMARK_MODELS.append(LT_TestNode)
+
+
+class MP_TestNodeBilling(MP_Node):
+    """Tree with per-node billing config that may be inherited from an ancestor."""
+
+    steplen = 3
+    desc = models.CharField(max_length=255, blank=True)
+    billing_rate = models.CharField(max_length=32, null=True)
+    billing_defined = models.BooleanField(default=False)

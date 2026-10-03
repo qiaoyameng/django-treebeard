@@ -26,8 +26,91 @@ class MP_NodeQuerySet(models.query.QuerySet):
     """
     Custom queryset for the tree node manager.
 
-    Needed only for the custom delete method.
+    Needed only for the custom delete method and inherited value annotations.
     """
+
+    def annotate_ancestor_value(
+        self, name, defined, field, *, source=None, source_field="path", output_field=None
+    ):
+        """
+        Annotate each node with the value of ``field`` taken from the nearest
+        ancestor (the node itself included) that has the value defined.
+
+        A node "has the value defined" when it matches the ``defined``
+        condition. The actual stored value is independent of that condition:
+        a defined value of ``NULL`` is an explicit override that clears any
+        value inherited from higher ancestors. Nodes that do not match
+        ``defined`` are skipped and the search continues up the tree.
+
+        Ancestor matching always uses full step boundaries: a path is an
+        ancestor of another path only when it is a prefix whose length differs
+        by an exact multiple of :attr:`MP_Node.steplen`, so lookalike prefixes
+        of a different length are never treated as ancestors.
+
+        :param name: name of the annotation holding the inherited value.
+        :param defined: a ``Q`` object (or anything accepted by
+                        ``QuerySet.filter``) describing which nodes define the
+                        value themselves.
+        :param field: name of the model field holding the value, or an
+                      expression (``F``/``Value``/...) returning it.
+        :param source: name of the annotation holding the source node's
+                       ``source_field`` value. Defaults to ``"<name>_source"``;
+                       pass ``False`` to skip the source annotation. The
+                       source is ``NULL`` when no ancestor defines the value,
+                       which distinguishes an explicit ``NULL`` override from
+                       a value that was never defined.
+        :param source_field: field of the source node exposed by the source
+                             annotation (defaults to ``"path"``).
+        :param output_field: optional output field for the value annotation,
+                             needed when ``field`` is an expression Django
+                             cannot infer the type of.
+
+        The annotations are added with correlated subqueries, so the whole
+        queryset (including filters, ordering and pagination) is resolved in a
+        fixed number of queries regardless of how many nodes it contains. The
+        inner lookup runs against an unfiltered queryset on the same database
+        alias, so target queryset filters never hide ancestor sources.
+        """
+        if source is None:
+            source = f"{name}_source"
+
+        if isinstance(field, str):
+            value_expr = F(field)
+            if output_field is None:
+                output_field = self.model._meta.get_field(field)
+        else:
+            value_expr = field
+
+        if isinstance(source_field, str):
+            source_expr = F(source_field)
+            source_output_field = self.model._meta.get_field(source_field)
+        else:
+            source_expr = source_field
+            source_output_field = output_field
+
+        # Start from a pristine queryset so filters, ordering and annotations
+        # of the target queryset are not inherited by the ancestor lookup.
+        ancestors = MP_NodeQuerySet(self.model, using=self.db)
+        ancestors = ancestors.annotate(
+            ancestor_prefix=Substr(OuterRef("path"), 1, Length("path")),
+            step_remainder=(Length(OuterRef("path")) - Length("path")) % self.model.steplen,
+        )
+        ancestors = ancestors.filter(
+            defined,
+            ancestor_prefix=F("path"),
+            step_remainder=0,
+        )
+        # Nearest ancestor first: the longest path that is still an ancestor.
+        ancestors = ancestors.order_by(-Length("path"))
+
+        annotations = {
+            name: Subquery(ancestors.values(value=value_expr)[:1], output_field=output_field),
+        }
+        if source is not False:
+            annotations[source] = Subquery(
+                ancestors.values(src=source_expr)[:1], output_field=source_output_field
+            )
+        return self.annotate(**annotations)
 
     def delete(self, *args, **kwargs):
         """
@@ -95,6 +178,10 @@ class MP_NodeManager(NodeManager):
     def get_queryset(self):
         """Sets the custom queryset as the default."""
         return MP_NodeQuerySet(self.model, using=self._db).order_by("path")
+
+    def annotate_ancestor_value(self, *args, **kwargs):
+        """Delegate to :meth:`MP_NodeQuerySet.annotate_ancestor_value`."""
+        return self.get_queryset().annotate_ancestor_value(*args, **kwargs)
 
     def get_tree(self, parent=None, max_depth: int | None = None):
         """

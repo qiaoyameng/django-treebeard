@@ -240,6 +240,38 @@ extra steps, materialized path is more efficient than other approaches.
 .. autoclass:: MP_NodeQuerySet
   :show-inheritance:
 
+  .. automethod:: annotate_ancestor_value
+
+Inheriting values from the nearest ancestor
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each node in a tree may override a configuration value (for example a billing
+rate) or leave it undefined so it is inherited from the nearest ancestor that
+defines it. :meth:`~MP_NodeQuerySet.annotate_ancestor_value` adds the resolved
+value and its source to every node of a queryset with a fixed number of
+queries, using correlated subqueries:
+
+.. code-block:: python
+
+    from django.db.models import Q
+
+    qs = Category.objects.annotate_ancestor_value(
+        "billing_rate",
+        Q(billing_defined=True),  # condition for "this node defines the value"
+        "billing_rate",           # field holding the value
+    )
+    for node in qs:
+        print(node.billing_rate, node.billing_rate_source)
+
+A defined value of ``NULL`` is an explicit override: it clears any value
+inherited from higher ancestors and is returned as ``NULL`` together with a
+non-null source. When no ancestor (including the node itself) defines the
+value, both the value and the source annotations are ``NULL``.
+
+The annotation works with filtered, ordered and paginated querysets, multiple
+root trees and every database alias, and ancestor matching always follows full
+step boundaries so lookalike path prefixes are never treated as ancestors.
+
 Signals
 -------
 
