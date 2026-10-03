@@ -1,12 +1,13 @@
 """Models and base API"""
 
+import inspect
 import operator
 import warnings
 from contextlib import suppress
 from functools import reduce
 
 from django.core import checks
-from django.db import models, transaction
+from django.db import models, router, transaction
 from django.db.models import Q
 from django.utils.functional import cached_property
 
@@ -485,6 +486,406 @@ class NodeManager(models.Manager):
             # extending the stack with the current node as the parent of the new nodes
             stack.extend([(node_obj, child) for child in deserialized_obj.children[::-1]])
         return added
+
+    def copy_subtree(
+        self,
+        node,
+        target=None,
+        position=None,
+        *,
+        target_parent=None,
+        using=None,
+        copy_fields=None,
+        recalculate_fields=None,
+        ignore_fields=None,
+        field_policies=None,
+        unique_callback=None,
+        external_references="reject",
+        external_refs=None,
+        copy_m2m=True,
+        m2m=None,
+    ):
+        """
+        Copy a node and all of its descendants.
+
+        Treebeard's structural fields and primary keys are regenerated. Other
+        concrete fields are copied unless ``field_policies`` says otherwise.
+        Self-references inside the copied subtree are rewired after every new
+        primary key is known. Self-references outside the subtree are either
+        preserved or rejected before writing.
+
+        ``field_policies`` maps a field name to ``"copy"``, ``"ignore"`` or a
+        callable. Callables receive the original node and field name and may
+        also accept ``mapping``, ``target_parent`` or ``position`` keyword
+        arguments. ``unique_callback`` is called for every unique field; it may
+        return a value or a mapping of field names to values.
+        """
+        if target_parent is not None:
+            target = target_parent
+        if external_refs is not None:
+            external_references = external_refs
+        if m2m is not None:
+            copy_m2m = m2m
+        if recalculate_fields is not None and not isinstance(recalculate_fields, dict):
+            raise TypeError("recalculate_fields must be a mapping of field names to callables.")
+
+        db = using or self.db or router.db_for_write(self.model)
+        with transaction.atomic(using=db):
+            root = self.db_manager(using=db).filter(pk=node.pk).get()
+            target = None if target is None else self.db_manager(using=db).filter(pk=target.pk).get()
+            source_nodes = self._get_copy_source_nodes(root, db)
+            subtree_ids = {source.pk for source in source_nodes}
+
+            if target is not None and target.pk in subtree_ids:
+                raise ValueError("Cannot copy a subtree to a node inside the same subtree.")
+            if external_references not in ("reject", "preserve", "keep"):
+                raise ValueError('external_references must be "reject" or "preserve".')
+
+            policies = self._copy_field_policies(copy_fields, recalculate_fields, ignore_fields, field_policies)
+            self._assert_external_references_allowed(source_nodes, subtree_ids, external_references, copy_m2m, db)
+
+            mapping = {}
+            clone_by_original_id = {}
+            clones = []
+            parent_by_id = {}
+
+            for source in source_nodes:
+                source_parent_id = parent_by_id.get(source.pk)
+                if source.pk == root.pk:
+                    new_parent = target
+                elif source_parent_id is None:
+                    new_parent = None
+                else:
+                    new_parent = clone_by_original_id[source_parent_id]
+                clone = self._build_copy(
+                    source,
+                    policies=policies,
+                    unique_callback=unique_callback,
+                    external_references=external_references,
+                    subtree_ids=subtree_ids,
+                    mapping=mapping,
+                    target=target,
+                    position=position,
+                )
+                clone = self._insert_copy(clone, new_parent, position if source.pk == root.pk else None, db)
+                mapping[source.pk] = clone.pk
+                clone_by_original_id[source.pk] = clone
+                clones.append((source, clone))
+                for child in self.db_manager(using=db).get_children(source):
+                    parent_by_id[child.pk] = source.pk
+
+            self._reconnect_internal_foreign_keys(clones, mapping, db)
+            if copy_m2m:
+                self._copy_m2m_relations(clones, mapping, external_references, db)
+
+            return mapping
+
+    def _copy_field_policies(self, copy_fields, recalculate_fields, ignore_fields, field_policies):
+        policies = {}
+        policies.update({field_name: "copy" for field_name in copy_fields or ()})
+        policies.update(recalculate_fields or {})
+        policies.update({field_name: "ignore" for field_name in ignore_fields or ()})
+        policies.update(field_policies or {})
+        invalid = {
+            name: policy
+            for name, policy in policies.items()
+            if policy not in ("copy", "ignore") and not callable(policy)
+        }
+        if invalid:
+            raise ValueError("Field policies must be 'copy', 'ignore' or callables.")
+        return policies
+
+    def _get_copy_source_nodes(self, root, db):
+        nodes = list(self.db_manager(using=db).get_tree(root))
+        node_ids = [node.pk for node in nodes]
+
+        concrete_subclasses = []
+
+        def collect_subclasses(model):
+            for subclass in model.__subclasses__():
+                if not subclass._meta.proxy and subclass._meta.concrete_model is subclass:
+                    concrete_subclasses.append(subclass)
+                collect_subclasses(subclass)
+
+        collect_subclasses(self.tree_model)
+
+        resolved = {}
+        for subclass in sorted(set(concrete_subclasses), key=lambda model: len(model._meta.get_parent_list())):
+            for node in subclass.objects.db_manager(using=db).filter(pk__in=node_ids):
+                resolved[node.pk] = node
+
+        return [resolved.get(node.pk, node) for node in nodes]
+
+    def _copy_structural_field_names(self):
+        return set(self.tree_model.MOVENODE_FORM_EXCLUDED_FIELDS)
+
+    def _copy_concrete_fields(self, source):
+        structural_fields = self._copy_structural_field_names()
+        for field in source._meta.concrete_fields:
+            if (
+                field.primary_key
+                or field.name in structural_fields
+                or getattr(field.remote_field, "parent_link", False)
+            ):
+                continue
+            yield field
+
+    def _copy_unique_field_names(self, source):
+        meta = source._meta
+        names = {
+            field.name
+            for field in meta.concrete_fields
+            if field.unique and not field.primary_key and field.name not in self._copy_structural_field_names()
+        }
+        for constraint in meta.constraints:
+            if getattr(constraint, "unique", False) and hasattr(constraint, "fields"):
+                names.update(constraint.fields)
+        for fields in meta.unique_together:
+            names.update(fields)
+        return {name for name in names if name not in self._copy_structural_field_names()}
+
+    def _is_self_relation(self, source, field):
+        related_model = getattr(field, "related_model", None)
+        return bool(related_model) and isinstance(source, related_model)
+
+    def _assert_external_references_allowed(self, source_nodes, subtree_ids, policy, copy_m2m, db):
+        if policy != "reject":
+            return
+
+        for source in source_nodes:
+            structural_fields = self._copy_structural_field_names()
+            for field in source._meta.concrete_fields:
+                if field.name in structural_fields:
+                    continue
+                if self._is_self_relation(source, field):
+                    target_id = getattr(source, field.attname)
+                    if target_id is not None and target_id not in subtree_ids:
+                        raise ValueError(f"Refusing to copy external self-reference in field {field.name!r}.")
+
+            if copy_m2m:
+                for field in source._meta.many_to_many:
+                    if self._is_self_relation(source, field):
+                        column_name = field.m2m_column_name()
+                        reverse_name = field.m2m_reverse_name()
+                        through = field.remote_field.through
+                        conditions = Q(**{column_name: source.pk})
+                        if field.remote_field.symmetrical:
+                            conditions |= Q(**{reverse_name: source.pk})
+                        if through._base_manager.using(db).filter(conditions).exclude(
+                            **{f"{column_name}__in": subtree_ids, f"{reverse_name}__in": subtree_ids}
+                        ).exists():
+                            raise ValueError(f"Refusing to copy external self-reference in field {field.name!r}.")
+
+    def _call_field_callback(self, callback, source, field_name, mapping, target, position):
+        parameters = inspect.signature(callback).parameters
+        aliases = {
+            "original": source,
+            "node": source,
+            "source": source,
+            "old_node": source,
+            "field": field_name,
+            "field_name": field_name,
+            "mapping": mapping,
+            "pk_mapping": mapping,
+            "target_parent": target,
+            "target": target,
+            "parent": target,
+            "position": position,
+            "pos": position,
+        }
+        has_var_keyword = any(kind == inspect.Parameter.VAR_KEYWORD for kind in parameters.values())
+        kwargs = {name: value for name, value in aliases.items() if has_var_keyword or name in parameters}
+        try:
+            inspect.signature(callback).bind_partial(**kwargs)
+        except TypeError:
+            positional_count = sum(
+                kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                for kind in parameters.values()
+            )
+            return callback(*[source, field_name, mapping, target, position][:positional_count])
+        return callback(**kwargs)
+
+    def _build_copy(
+        self, source, *, policies, unique_callback, external_references, subtree_ids, mapping, target, position
+    ):
+        clone = source.__class__()
+        unique_names = self._copy_unique_field_names(source)
+
+        for field in self._copy_concrete_fields(source):
+            name = field.name
+            policy = policies.get(name, "copy")
+            if name in unique_names:
+                if unique_callback is not None:
+                    value = self._call_field_callback(unique_callback, source, name, mapping, target, position)
+                    if isinstance(value, dict):
+                        for unique_name, unique_value in value.items():
+                            setattr(clone, unique_name, unique_value)
+                        continue
+                elif callable(policy):
+                    value = self._call_field_callback(policy, source, name, mapping, target, position)
+                else:
+                    raise ValueError(f"Unique field {name!r} requires unique_callback or a callable field policy.")
+            elif callable(policy):
+                value = self._call_field_callback(policy, source, name, mapping, target, position)
+            elif policy == "ignore":
+                continue
+            else:
+                value = getattr(source, field.attname if field.remote_field else name)
+
+            if field.remote_field and self._is_self_relation(source, field):
+                source_id = getattr(source, field.attname)
+                if source_id is None:
+                    value = None
+                elif source_id in subtree_ids:
+                    value = None if field.null else source_id
+                elif external_references == "reject":
+                    value = None
+                else:
+                    value = source_id
+
+            setattr(clone, field.attname if field.remote_field else name, value)
+
+        return clone
+
+    def _insert_copy(self, clone, parent, position, db):
+        manager = self.db_manager(using=db)
+        if parent is None:
+            if position in (None, "last-root", "sorted-root") or (
+                position == "sorted-sibling" and self.tree_model.node_order_by
+            ):
+                return manager.add_root(instance=clone)
+            if position == "first-root":
+                first_root = manager.get_first_root_node()
+                return manager.add_sibling(first_root, "first-sibling", instance=clone)
+            if position in {"first-sibling", "left", "right", "last-sibling"}:
+                target_node = (
+                    manager.get_last_root_node() if position == "last-sibling" else manager.get_first_root_node()
+                )
+                return manager.add_sibling(target_node, position, instance=clone)
+            raise ValueError(f"Unsupported root insertion position: {position!r}")
+
+        if position is None:
+            position = "sorted-child" if self.tree_model.node_order_by else "last-child"
+        if position in ("last-child", "sorted-child"):
+            return manager.add_child(parent, instance=clone)
+        if position == "first-child":
+            clone = manager.add_child(parent, instance=clone)
+            manager.move(clone, parent, "first-child")
+            return manager.filter(pk=clone.pk).get()
+        raise ValueError(f"Unsupported child insertion position: {position!r}")
+
+    def _reconnect_internal_foreign_keys(self, clones, mapping, db):
+        fields_by_class = {}
+        for source, clone in clones:
+            fields = fields_by_class.setdefault(source.__class__, [])
+            if not fields:
+                structural_fields = self._copy_structural_field_names()
+                fields.extend(
+                    field
+                    for field in source._meta.concrete_fields
+                    if field.remote_field
+                    and self._is_self_relation(source, field)
+                    and not getattr(field.remote_field, "parent_link", False)
+                    and field.name not in structural_fields
+                )
+
+            for field in fields:
+                old_id = getattr(source, field.attname)
+                if old_id in mapping:
+                    setattr(clone, field.attname, mapping[old_id])
+
+        instances_by_class = {}
+        for source, clone in clones:
+            instances_by_class.setdefault(source.__class__, []).append(clone)
+        for model, instances in instances_by_class.items():
+            model_clones = [(source, clone) for source, clone in clones if source.__class__ is model]
+            fields = [
+                field
+                for field in fields_by_class[model]
+                if any(
+                    getattr(instance, field.attname) != getattr(source, field.attname)
+                    for source, instance in model_clones
+                )
+            ]
+            if fields:
+                model.objects.db_manager(using=db).bulk_update(instances, [field.name for field in fields])
+
+    def _copy_m2m_relations(self, clones, mapping, external_references, db):
+        edges = {}
+        for source, clone in clones:
+            for field in source._meta.many_to_many:
+                through = field.remote_field.through
+                column_name = field.m2m_column_name()
+                reverse_name = field.m2m_reverse_name()
+                self_relation = self._is_self_relation(source, field)
+
+                if not self_relation:
+                    getattr(clone, field.name).set(getattr(source, field.name).all().using(db))
+                    continue
+
+                if not through._meta.auto_created:
+                    self._copy_custom_m2m_through(
+                        source=source,
+                        clone=clone,
+                        field=field,
+                        mapping=mapping,
+                        external_references=external_references,
+                        db=db,
+                    )
+                    continue
+
+                conditions = Q(**{column_name: source.pk})
+                if field.remote_field.symmetrical:
+                    conditions |= Q(**{reverse_name: source.pk})
+                for row in through._base_manager.using(db).filter(conditions):
+                    left_id = getattr(row, column_name)
+                    right_id = getattr(row, reverse_name)
+                    other_id = right_id if left_id == source.pk else left_id
+                    if other_id in mapping:
+                        related_id = mapping[other_id]
+                    elif external_references in ("preserve", "keep"):
+                        related_id = other_id
+                    else:
+                        continue
+
+                    left_id, right_id = clone.pk, related_id
+                    if field.remote_field.symmetrical and right_id < left_id:
+                        left_id, right_id = right_id, left_id
+                    edges.setdefault((field.name, left_id), set()).add(right_id)
+
+        for (field_name, left_id), right_ids in edges.items():
+            left_node = self.db_manager(using=db).filter(pk=left_id).get()
+            getattr(left_node, field_name).add(*right_ids)
+
+    def _copy_custom_m2m_through(self, *, source, clone, field, mapping, external_references, db):
+        through = field.remote_field.through
+        column_name = field.m2m_column_name()
+        reverse_name = field.m2m_reverse_name()
+        rows_to_create = []
+
+        for row in through._base_manager.using(db).filter(**{column_name: source.pk}):
+            old_related_id = getattr(row, reverse_name)
+            if old_related_id in mapping:
+                related_id = mapping[old_related_id]
+            elif external_references in ("preserve", "keep"):
+                related_id = old_related_id
+            else:
+                continue
+
+            new_row = through()
+            setattr(new_row, column_name, clone.pk)
+            setattr(new_row, reverse_name, related_id)
+            for concrete_field in through._meta.concrete_fields:
+                if (
+                    concrete_field.primary_key
+                    or concrete_field.name in {column_name, reverse_name}
+                    or getattr(concrete_field.remote_field, "parent_link", False)
+                ):
+                    continue
+                setattr(new_row, concrete_field.name, getattr(row, concrete_field.name))
+            rows_to_create.append(new_row)
+
+        through._base_manager.using(db).bulk_create(rows_to_create, ignore_conflicts=True)
 
     def dump_bulk(self, parent=None, keep_ids=True):  # pragma: no cover
         """

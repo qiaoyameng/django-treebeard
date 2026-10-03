@@ -271,6 +271,8 @@ API
 
   .. automethod:: load_bulk
 
+  .. automethod:: copy_subtree
+
      .. note::
 
             Any internal data that you may have stored in your

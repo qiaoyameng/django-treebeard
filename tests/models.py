@@ -59,7 +59,22 @@ class MP_TestNodeCustomId(MP_Node, DescMixin):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
 
+class MP_TestNodeCopySubtree(MP_Node, DescMixin):
+    steplen = 3
+    code = models.CharField(max_length=255, unique=True)
+    score = models.IntegerField(default=0)
+    link = models.ForeignKey("self", null=True, on_delete=models.SET_NULL, related_name="+")
+    links = models.ManyToManyField("self")
+
+
 class NS_TestNode(NS_Node, DescMixin): ...
+
+
+class NS_TestNodeCopySubtree(NS_Node, DescMixin):
+    code = models.CharField(max_length=255, unique=True)
+    score = models.IntegerField(default=0)
+    link = models.ForeignKey("self", null=True, on_delete=models.SET_NULL, related_name="+")
+    links = models.ManyToManyField("self")
 
 
 class NS_TestNodeSomeDep(models.Model):
@@ -82,6 +97,21 @@ class AL_TestNode(AL_Node, DescMixin):
         on_delete=models.CASCADE,
     )
     sib_order = models.PositiveIntegerField()
+
+
+class AL_TestNodeCopySubtree(AL_Node, DescMixin):
+    parent = models.ForeignKey(
+        "self",
+        related_name="children_set",
+        null=True,
+        db_index=True,
+        on_delete=models.CASCADE,
+    )
+    sib_order = models.PositiveIntegerField()
+    code = models.CharField(max_length=255, unique=True)
+    score = models.IntegerField(default=0)
+    link = models.ForeignKey("self", null=True, on_delete=models.SET_NULL, related_name="+")
+    links = models.ManyToManyField("self")
 
 
 class AL_TestNodeSomeDep(models.Model):

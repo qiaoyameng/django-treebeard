@@ -16,6 +16,7 @@ from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core import checks
 from django.core.checks.model_checks import check_all_models
 from django.core.exceptions import PermissionDenied
+from django.db import IntegrityError, transaction
 from django.db.models import Manager
 from django.db.models.signals import post_save
 from django.dispatch import receiver
@@ -98,6 +99,18 @@ def model_without_data(request):
 @pytest.fixture(scope="function", params=models.BASE_MODELS)
 def model_without_proxy(request):
     request.param.objects.load_bulk(BASE_DATA)
+    return request.param
+
+
+@pytest.fixture(
+    scope="function",
+    params=[
+        models.AL_TestNodeCopySubtree,
+        models.MP_TestNodeCopySubtree,
+        models.NS_TestNodeCopySubtree,
+    ],
+)
+def copy_subtree_model(request):
     return request.param
 
 
@@ -541,6 +554,171 @@ class TestClassMethods(TestNonEmptyTree):
         related_model.objects.load_bulk(related_data)
         got = related_model.objects.dump_bulk(keep_ids=False)
         assert got == related_data
+
+    def test_copy_subtree_reconnects_internal_foreign_keys_and_m2m(self, copy_subtree_model):
+        def node_data(desc, code, sib_order=None):
+            data = {"desc": desc, "code": code}
+            if copy_subtree_model is models.AL_TestNodeCopySubtree:
+                data["sib_order"] = sib_order
+            return data
+
+        root = copy_subtree_model.objects.add_root(node_data("root", "root", 1))
+        first = copy_subtree_model.objects.add_child(root, node_data("first", "first", 1))
+        second = copy_subtree_model.objects.add_child(root, node_data("second", "second", 2))
+        grandchild = copy_subtree_model.objects.add_child(first, node_data("child", "child", 1))
+
+        root.link = grandchild
+        root.save()
+        first.link = second
+        second.link = first
+        first.save()
+        second.save()
+
+        first.links.set([second])
+
+        original_snapshot = list(copy_subtree_model.objects.order_by("pk").values("desc", "code", "link_id"))
+
+        mapping = copy_subtree_model.objects.copy_subtree(
+            root,
+            None,
+            "last-root",
+            unique_callback=lambda original, field: f"{original.code}-copy",
+        )
+
+        copied_root = copy_subtree_model.objects.get(pk=mapping[root.pk])
+        copied_first = copy_subtree_model.objects.get(pk=mapping[first.pk])
+        copied_second = copy_subtree_model.objects.get(pk=mapping[second.pk])
+        copied_grandchild = copy_subtree_model.objects.get(pk=mapping[grandchild.pk])
+
+        assert mapping == {
+            root.pk: copied_root.pk,
+            first.pk: copied_first.pk,
+            second.pk: copied_second.pk,
+            grandchild.pk: copied_grandchild.pk,
+        }
+        assert copied_root.link_id == copied_grandchild.pk
+        assert copied_first.link_id == copied_second.pk
+        assert copied_second.link_id == copied_first.pk
+        assert set(getattr(copied_first, "links").values_list("pk", flat=True)) == {copied_second.pk}
+        assert set(getattr(copied_second, "links").values_list("pk", flat=True)) == {copied_first.pk}
+        assert set(getattr(first, "links").values_list("pk", flat=True)) == {second.pk}
+
+        copied_root.desc = "changed copy"
+        copied_root.code = "changed-copy"
+        copied_root.save()
+        root.refresh_from_db()
+        assert root.desc == "root"
+        assert root.code == "root"
+        assert (
+            list(copy_subtree_model.objects.order_by("pk").values("desc", "code", "link_id"))[:4]
+            == original_snapshot
+        )
+
+    def test_copy_subtree_rejects_and_preserves_external_references(self, copy_subtree_model):
+        def node_data(desc, code, sib_order=None):
+            data = {"desc": desc, "code": code}
+            if copy_subtree_model is models.AL_TestNodeCopySubtree:
+                data["sib_order"] = sib_order
+            return data
+
+        root = copy_subtree_model.objects.add_root(node_data("root", "root", 1))
+        child = copy_subtree_model.objects.add_child(root, node_data("child", "child", 1))
+        outside = copy_subtree_model.objects.add_root(node_data("outside", "outside", 2))
+        child.link = outside
+        child.save()
+
+        with pytest.raises(ValueError, match="external self-reference"):
+            copy_subtree_model.objects.copy_subtree(
+                root,
+                None,
+                "last-root",
+                unique_callback=lambda original, field: f"{original.code}-rejected",
+            )
+        assert copy_subtree_model.objects.count() == 3
+
+        mapping = copy_subtree_model.objects.copy_subtree(
+            root,
+            None,
+            "last-root",
+            unique_callback=lambda original, field: f"{original.code}-copy",
+            external_references="preserve",
+        )
+        copied_child = copy_subtree_model.objects.get(pk=mapping[child.pk])
+        assert copied_child.link_id == outside.pk
+
+    def test_copy_subtree_rolls_back_callback_failure(self, copy_subtree_model):
+        def node_data(desc, code, sib_order=None):
+            data = {"desc": desc, "code": code}
+            if copy_subtree_model is models.AL_TestNodeCopySubtree:
+                data["sib_order"] = sib_order
+            return data
+
+        root = copy_subtree_model.objects.add_root(node_data("root", "root", 1))
+        copy_subtree_model.objects.add_child(root, node_data("child", "child", 1))
+
+        def callback(original, field):
+            if original.desc == "child":
+                raise IntegrityError("boom")
+            return f"{original.code}-copy"
+
+        with pytest.raises(IntegrityError, match="boom"):
+            with transaction.atomic():
+                copy_subtree_model.objects.copy_subtree(
+                    root,
+                    None,
+                    "last-root",
+                    unique_callback=callback,
+                )
+        assert copy_subtree_model.objects.count() == 2
+
+    def test_copy_subtree_preserves_inherited_model_fields(self):
+        root = models.MP_TestNodeInherited.objects.add_root(
+            {"desc": "root", "extra_desc": "root-extra"}
+        )
+        models.MP_TestNodeInherited.objects.add_child(root, {"desc": "child", "extra_desc": "child-extra"})
+
+        mapping = models.MP_TestNodeInherited.objects.copy_subtree(root, None, "last-root")
+
+        copied_root = models.MP_TestNodeInherited.objects.get(pk=mapping[root.pk])
+        copied_child_id = next(pk for old_pk, pk in mapping.items() if old_pk != root.pk)
+        copied_child = models.MP_TestNodeInherited.objects.get(pk=copied_child_id)
+        assert copied_root.desc == "root"
+        assert copied_root.extra_desc == "root-extra"
+        assert copied_child.extra_desc == "child-extra"
+
+    def test_copy_subtree_to_parent_with_field_policies(self):
+        target_root = models.MP_TestNodeCopySubtree.objects.add_root(
+            {"desc": "target", "code": "target", "score": 0}
+        )
+        root = models.MP_TestNodeCopySubtree.objects.add_root(
+            {"desc": "root", "code": "root", "score": 1}
+        )
+        child = models.MP_TestNodeCopySubtree.objects.add_child(
+            root,
+            {"desc": "child", "code": "child", "score": 2},
+        )
+
+        mapping = models.MP_TestNodeCopySubtree.objects.copy_subtree(
+            root,
+            target_root,
+            "first-child",
+            ignore_fields={"desc"},
+            recalculate_fields={
+                "score": lambda original, field: original.score + 10,
+            },
+            unique_callback=lambda original, field: f"{original.code}-copy",
+        )
+
+        copied_root = models.MP_TestNodeCopySubtree.objects.get(pk=mapping[root.pk])
+        copied_child = models.MP_TestNodeCopySubtree.objects.get(pk=mapping[child.pk])
+        assert copied_root.desc == ""
+        assert copied_child.desc == ""
+        assert copied_root.score == 11
+        assert copied_child.score == 12
+        assert copied_root.path.startswith(target_root.path)
+        target_root.refresh_from_db()
+        assert list(models.MP_TestNodeCopySubtree.objects.get_children(target_root)) == [copied_root]
+        assert list(models.MP_TestNodeCopySubtree.objects.get_children(copied_root)) == [copied_child]
 
     def test_get_root_nodes(self, model, django_assert_max_num_queries):
         with django_assert_max_num_queries(1):
