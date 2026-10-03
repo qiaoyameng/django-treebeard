@@ -132,6 +132,22 @@ API
 
   .. automethod:: get_tree
 
+  .. automethod:: project_tree
+
+     Available on materialized-path trees. Accepts the complete set of allowed
+     nodes as a queryset or primary-key collection. Slicing the queryset is not
+     supported; use ``offset`` and ``limit`` after the visible tree has been
+     rebuilt.
+
+     ``PROJECTION_PRUNE`` removes a hidden node and its subtree.
+     ``PROJECTION_PROMOTE`` moves allowed descendants below a hidden node to
+     their nearest visible ancestor.
+
+     Returned node dictionaries include recalculated ``depth``, ``parent``,
+     ``numchild``, traversal ``open``/``close`` metadata and serialized model
+     fields. They never include the original materialized path or the original
+     depth and child-count fields.
+
   .. automethod:: get_first_root_node
 
      Example:

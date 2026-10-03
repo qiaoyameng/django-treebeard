@@ -21,6 +21,9 @@ from treebeard.utils import check_create_args, prepare_dumpdata_for_loading, sav
 path_updated = Signal()
 nodes_deleted = Signal()
 
+PROJECTION_PRUNE = "prune"
+PROJECTION_PROMOTE = "promote"
+
 
 class MP_NodeQuerySet(models.query.QuerySet):
     """
@@ -121,6 +124,271 @@ class MP_NodeManager(NodeManager):
             filters["depth__lte"] = max_depth + (parent.depth if parent else 0)
 
         return cls.objects.filter(**filters)
+
+    def project_tree(
+        self,
+        allowed,
+        *,
+        mode: str = PROJECTION_PRUNE,
+        max_visible_depth: int | None = None,
+        offset: int = 0,
+        limit: int | None = None,
+    ):
+        """
+        Build a read-only projection of the nodes that are allowed to be shown.
+
+        :param allowed: A queryset of allowed nodes, a queryset of allowed
+            primary keys, or an iterable of primary keys.
+        :param mode: ``PROJECTION_PRUNE`` hides a node and its entire subtree,
+            or ``PROJECTION_PROMOTE`` moves allowed descendants below a hidden
+            node to their nearest visible ancestor.
+        :param max_visible_depth: Optional maximum depth in the resulting tree.
+        :param offset: Number of projected depth-first nodes to skip.
+        :param limit: Maximum number of projected nodes to return.
+
+        The original nodes and tree are never modified. The returned data uses
+        recalculated visible depths, parents and child counts. Materialized
+        paths and the original depth/numchild values are not exposed.
+        """
+        if mode not in (PROJECTION_PRUNE, PROJECTION_PROMOTE):
+            raise ValueError("mode must be PROJECTION_PRUNE or PROJECTION_PROMOTE")
+        if max_visible_depth is not None and (
+            isinstance(max_visible_depth, bool)
+            or not isinstance(max_visible_depth, int)
+            or max_visible_depth < 1
+        ):
+            raise ValueError("max_visible_depth must be a positive integer")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            raise ValueError("limit must be a positive integer")
+        if offset and limit is None:
+            raise ValueError("offset requires limit")
+
+        tree_model = self.tree_model
+        database_alias = self._db
+        manager = tree_model.objects.using(database_alias) if database_alias else tree_model.objects
+
+        if isinstance(allowed, models.QuerySet):
+            if not issubclass(allowed.model, tree_model):
+                raise ValueError("allowed must be a queryset for this tree model")
+            if allowed.query.low_mark != 0 or allowed.query.high_mark is not None:
+                raise ValueError("sliced querysets are not supported; pass offset and limit instead")
+
+            database_alias = allowed.db
+            manager = tree_model.objects.using(database_alias) if database_alias else tree_model.objects
+
+            projection_fields = getattr(allowed, "_fields", None)
+            if projection_fields:
+                pk_names = {"pk", "Pk", tree_model._meta.pk.name, tree_model._meta.pk.attname}
+                if len(projection_fields) != 1 or projection_fields[0] not in pk_names:
+                    raise ValueError("a values/values_list queryset must only return primary keys")
+            nodes = list(manager.filter(pk__in=allowed).order_by("path"))
+        else:
+            try:
+                allowed_pks = list(allowed)
+            except TypeError as exc:
+                raise ValueError("allowed must be a queryset or an iterable of primary keys") from exc
+            nodes = list(manager.filter(pk__in=allowed_pks).order_by("path"))
+
+        if not nodes:
+            return {
+                "mode": mode,
+                "multi_root": False,
+                "max_visible_depth": 0,
+                "truncated": False,
+                "root_pks": [],
+                "nodes": [],
+                "total_nodes": 0,
+                "offset": offset,
+                "limit": limit,
+                "has_previous": False,
+                "has_next": False,
+                "open_pks": [],
+            }
+
+        allowed_paths = {node.path for node in nodes}
+        visible_by_path = {}
+        topology = []
+
+        for node in nodes:
+            original_depth = len(node.path) // tree_model.steplen
+            projected_parent_path = None
+
+            if original_depth > 1:
+                if mode == PROJECTION_PRUNE:
+                    parent_path = tree_model._get_basepath(node.path, original_depth - 1)
+                    if parent_path not in allowed_paths:
+                        continue
+                    projected_parent_path = parent_path
+                else:
+                    for ancestor_depth in range(original_depth - 1, 0, -1):
+                        ancestor_path = tree_model._get_basepath(node.path, ancestor_depth)
+                        if ancestor_path in allowed_paths:
+                            projected_parent_path = ancestor_path
+                            break
+
+            entry = {
+                "node": node,
+                "parent_path": projected_parent_path,
+                "depth": None,
+                "visible": False,
+                "included": False,
+            }
+            visible_by_path[node.path] = entry
+            topology.append(entry)
+
+        candidates = []
+        truncated = False
+        for entry in topology:
+            parent_entry = visible_by_path.get(entry["parent_path"]) if entry["parent_path"] else None
+            if mode == PROJECTION_PRUNE and entry["parent_path"] and parent_entry is None:
+                continue
+            if parent_entry is not None and not parent_entry["visible"]:
+                continue
+            entry["visible"] = True
+            candidates.append(entry)
+
+        included = []
+        for entry in candidates:
+            depth = self._get_projected_depth(entry, visible_by_path)
+            if max_visible_depth is not None and depth > max_visible_depth:
+                truncated = True
+                continue
+            entry["depth"] = depth
+            entry["included"] = True
+            included.append(entry)
+
+        if not included:
+            return {
+                "mode": mode,
+                "multi_root": False,
+                "max_visible_depth": 0,
+                "truncated": truncated,
+                "root_pks": [],
+                "nodes": [],
+                "total_nodes": 0,
+                "offset": offset,
+                "limit": limit,
+                "has_previous": False,
+                "has_next": False,
+                "open_pks": [],
+            }
+
+        child_counts = collections.Counter()
+        for entry in included:
+            parent_entry = visible_by_path.get(entry["parent_path"]) if entry["parent_path"] else None
+            if parent_entry and parent_entry["included"]:
+                child_counts[parent_entry["node"].pk] += 1
+
+        root_pks = [
+            entry["node"].pk
+            for entry in included
+            if not entry["parent_path"]
+            or entry["parent_path"] not in visible_by_path
+            or not visible_by_path[entry["parent_path"]]["included"]
+        ]
+
+        internal_fields = {"path", "depth", "numchild"}
+        serialized_field_names = [
+            field.name
+            for field in tree_model._meta.concrete_fields
+            if not field.primary_key and field.name not in internal_fields
+        ]
+        included_nodes = [entry["node"] for entry in included]
+        serialized_nodes = serializers.serialize(
+            "python",
+            included_nodes,
+            fields=serialized_field_names,
+            use_natural_foreign_keys=False,
+            use_natural_primary_keys=False,
+        )
+        fields_by_pk = {node.pk: serialized["fields"] for node, serialized in zip(included_nodes, serialized_nodes)}
+
+        all_nodes = []
+        for entry in included:
+            node = entry["node"]
+            parent_entry = visible_by_path.get(entry["parent_path"]) if entry["parent_path"] else None
+            parent_pk = parent_entry["node"].pk if parent_entry and parent_entry["included"] else None
+            all_nodes.append(
+                {
+                    "pk": node.pk,
+                    "parent": parent_pk,
+                    "depth": entry["depth"],
+                    "numchild": child_counts[node.pk],
+                    "fields": fields_by_pk[node.pk],
+                }
+            )
+
+        def annotate_nodes(nodes_to_annotate, *, finalize_last):
+            previous_local_depth = None
+            for index, node in enumerate(nodes_to_annotate):
+                is_last = index == len(nodes_to_annotate) - 1
+                closes = []
+                if previous_local_depth is not None and node["depth"] < previous_local_depth:
+                    closes = list(range(previous_local_depth - node["depth"]))
+                if finalize_last and is_last:
+                    closes = list(range(node["depth"]))
+                node["open"] = previous_local_depth is None or node["depth"] > previous_local_depth
+                node["close"] = closes
+                previous_local_depth = node["depth"]
+
+        annotate_nodes(all_nodes, finalize_last=True)
+        page_entries = included[offset : offset + limit] if limit is not None else included[offset:]
+        page_nodes = all_nodes[offset : offset + limit] if limit is not None else all_nodes[offset:]
+        if offset or len(page_nodes) < len(all_nodes):
+            annotate_nodes(page_nodes, finalize_last=not offset + len(page_nodes) < len(all_nodes))
+
+        page_pks = {node["pk"] for node in page_nodes}
+        for node in page_nodes:
+            node["parent_in_page"] = node["parent"] in page_pks if node["parent"] is not None else False
+
+        if offset and page_entries:
+            previous_entry = included[offset - 1]
+            page_nodes[0]["open"] = page_entries[0]["depth"] > previous_entry["depth"]
+            for level in range(previous_entry["depth"] - page_entries[0]["depth"]):
+                if level not in page_nodes[0]["close"]:
+                    page_nodes[0]["close"].append(level)
+
+        last_entry = page_entries[-1] if page_entries else None
+        open_pks = []
+        if page_entries and offset + len(page_nodes) < len(all_nodes):
+            current = last_entry
+            while current["parent_path"]:
+                parent = visible_by_path.get(current["parent_path"])
+                if parent is None or not parent["included"]:
+                    break
+                open_pks.append(parent["node"].pk)
+                current = parent
+
+        end = offset + len(page_nodes)
+
+        return {
+            "mode": mode,
+            "multi_root": len(root_pks) > 1,
+            "max_visible_depth": max(entry["depth"] for entry in included),
+            "truncated": truncated,
+            "root_pks": root_pks,
+            "nodes": page_nodes,
+            "total_nodes": len(all_nodes),
+            "offset": offset,
+            "limit": limit,
+            "has_previous": offset > 0,
+            "has_next": end < len(all_nodes),
+            "open_pks": list(reversed(open_pks)),
+        }
+
+    @staticmethod
+    def _get_projected_depth(entry, visible_by_path):
+        depth = 1
+        current = entry
+        while current["parent_path"]:
+            parent = visible_by_path.get(current["parent_path"])
+            if parent is None or not parent["visible"]:
+                break
+            depth += 1
+            current = parent
+        return depth
 
     def fix_tree(self, fix_paths=False, parent=None):
         """
