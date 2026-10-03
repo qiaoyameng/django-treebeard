@@ -42,6 +42,12 @@ class MP_TestNode(MP_Node, DescMixin):
     steplen = 3
 
 
+class MP_TestNodeClosestAncestor(MP_Node, DescMixin):
+    steplen = 3
+    billing_defined = models.BooleanField(default=False)
+    billing_amount = models.IntegerField(null=True)
+
+
 class MP_TestNodeSomeDep(models.Model):
     node = models.ForeignKey(MP_TestNode, on_delete=models.CASCADE)
 

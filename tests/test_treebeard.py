@@ -16,7 +16,7 @@ from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core import checks
 from django.core.checks.model_checks import check_all_models
 from django.core.exceptions import PermissionDenied
-from django.db.models import Manager
+from django.db.models import F, Manager, Q
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.forms import ValidationError
@@ -4757,6 +4757,172 @@ class TestMP_TreeDescendantsPerformance(TestTreeBase):
             with django_assert_num_queries(expected):
                 # converting to list to force queryset evaluation
                 list(model.objects.get_descendants(node))
+
+
+@pytest.mark.django_db
+class TestMP_TreeClosestAncestorAnnotation:
+    def test_closest_defined_ancestor_value_and_source(self):
+        model = models.MP_TestNodeClosestAncestor
+        root_a = model.objects.add_root({"desc": "A", "billing_defined": True, "billing_amount": 10})
+        root_b = model.objects.add_root({"desc": "B", "billing_defined": True, "billing_amount": 20})
+        child_a = model.objects.add_child(root_a, {"desc": "A1"})
+        clear_a = model.objects.add_child(
+            child_a,
+            {"desc": "A1-clear", "billing_defined": True, "billing_amount": None},
+        )
+        model.objects.add_child(clear_a, {"desc": "A1-clear-1"})
+        model.objects.add_child(root_b, {"desc": "B1"})
+
+        annotated = (
+            model.objects.filter(desc__in=["A", "B", "A1", "A1-clear", "A1-clear-1", "B1"])
+            .annotate_closest_ancestor_value(
+                "billing_amount",
+                condition=Q(billing_defined=True),
+                value_name="effective_amount",
+                source_name="source_id",
+            )
+            .order_by("desc")
+        )
+
+        results = {node.desc: (node.effective_amount, node.source_id) for node in annotated}
+
+        assert results == {
+            "A": (10, root_a.pk),
+            "A1": (10, root_a.pk),
+            "A1-clear": (None, clear_a.pk),
+            "A1-clear-1": (None, clear_a.pk),
+            "B": (20, root_b.pk),
+            "B1": (20, root_b.pk),
+        }
+        assert results["A1-clear-1"] == (None, clear_a.pk)
+        assert results["B1"] == (20, root_b.pk)
+
+    def test_default_annotation_names_accept_field_expression(self):
+        model = models.MP_TestNodeClosestAncestor
+        root = model.objects.add_root({"desc": "root", "billing_defined": True, "billing_amount": 10})
+
+        node = (
+            model.objects.filter(pk=root.pk)
+            .annotate_closest_ancestor_value(
+                F("billing_amount"),
+                condition=Q(billing_defined=True),
+            )
+            .get()
+        )
+
+        assert node.inherited_billing_amount == 10
+        assert node.inherited_billing_amount_source == root.pk
+
+    def test_alternate_condition_and_source_names(self):
+        model = models.MP_TestNodeClosestAncestor
+        root = model.objects.add_root({"desc": "root", "billing_defined": True, "billing_amount": 10})
+
+        node = (
+            model.objects.filter(pk=root.pk)
+            .annotate_closest_ancestor_value(
+                "billing_amount",
+                defined_when=Q(billing_defined=True),
+                value_name="amount",
+                source_pk_name="source_pk",
+            )
+            .get()
+        )
+
+        assert node.amount == 10
+        assert node.source_pk == root.pk
+
+    def test_inherited_value_alias(self):
+        model = models.MP_TestNodeClosestAncestor
+        root = model.objects.add_root({"desc": "root", "billing_defined": True, "billing_amount": 10})
+
+        node = (
+            model.objects.filter(pk=root.pk)
+            .annotate_inherited_value(
+                "billing_amount",
+                condition=Q(billing_defined=True),
+            )
+            .get()
+        )
+
+        assert node.inherited_billing_amount == 10
+        assert node.inherited_billing_amount_source == root.pk
+
+    def test_annotation_respects_filtering_order_pagination_and_uses_one_query(
+        self, django_assert_num_queries
+    ):
+        model = models.MP_TestNodeClosestAncestor
+        root = model.objects.add_root({"desc": "root", "billing_defined": True, "billing_amount": 10})
+        for index in range(5):
+            model.objects.add_child(root, {"desc": f"child-{index}"})
+
+        annotated = (
+            model.objects.filter(desc__startswith="child-")
+            .annotate_closest_ancestor_value(
+                "billing_amount",
+                condition=Q(billing_defined=True),
+                value_name="effective_amount",
+                source_name="source_id",
+            )
+            .order_by("-desc")[1:4]
+        )
+
+        with django_assert_num_queries(1):
+            nodes = list(annotated)
+
+        assert [node.desc for node in nodes] == ["child-3", "child-2", "child-1"]
+        assert [(node.effective_amount, node.source_id) for node in nodes] == [(10, root.pk)] * 3
+        assert annotated.db == "default"
+
+    def test_annotation_does_not_match_partial_step_prefixes(self):
+        model = models.MP_TestNodeClosestAncestor
+        root = model.objects.add_root({"desc": "root", "billing_defined": True, "billing_amount": 10})
+        target = model.objects.add_child(root, {"desc": "target"})
+        similar = model.objects.add_root(
+            {"desc": "similar-prefix", "billing_defined": True, "billing_amount": 99}
+        )
+        model.objects.filter(pk=similar.pk).update(
+            path=target.path[: model.steplen + 1],
+            depth=target.depth,
+        )
+
+        annotated = (
+            model.objects.filter(pk=target.pk)
+            .annotate_closest_ancestor_value(
+                "billing_amount",
+                condition=Q(billing_defined=True),
+                value_name="effective_amount",
+                source_name="source_id",
+            )
+            .get()
+        )
+
+        assert (annotated.effective_amount, annotated.source_id) == (10, root.pk)
+
+    def test_annotation_is_recalculated_after_target_moves(self):
+        model = models.MP_TestNodeClosestAncestor
+        source_a = model.objects.add_root({"desc": "source-a", "billing_defined": True, "billing_amount": 10})
+        source_b = model.objects.add_root({"desc": "source-b", "billing_defined": True, "billing_amount": 20})
+        target = model.objects.add_child(source_a, {"desc": "target"})
+
+        def annotated_target():
+            return (
+                model.objects.filter(pk=target.pk)
+                .annotate_closest_ancestor_value(
+                    "billing_amount",
+                    condition=Q(billing_defined=True),
+                    value_name="effective_amount",
+                    source_name="source_id",
+                )
+                .get()
+            )
+
+        refreshed = annotated_target()
+        assert (refreshed.effective_amount, refreshed.source_id) == (10, source_a.pk)
+
+        model.objects.move(target, source_b, "last-child")
+
+        moved = annotated_target()
+        assert (moved.effective_amount, moved.source_id) == (20, source_b.pk)
 
 
 @pytest.mark.django_db

@@ -240,6 +240,8 @@ extra steps, materialized path is more efficient than other approaches.
 .. autoclass:: MP_NodeQuerySet
   :show-inheritance:
 
+  .. automethod:: annotate_closest_ancestor_value
+
 Signals
 -------
 

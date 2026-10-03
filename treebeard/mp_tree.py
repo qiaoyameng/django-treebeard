@@ -26,7 +26,7 @@ class MP_NodeQuerySet(models.query.QuerySet):
     """
     Custom queryset for the tree node manager.
 
-    Needed only for the custom delete method.
+    Needed for the custom delete method and materialized-path annotations.
     """
 
     def delete(self, *args, **kwargs):
@@ -87,6 +87,69 @@ class MP_NodeQuerySet(models.query.QuerySet):
 
     delete.alters_data = True
     delete.queryset_only = True
+
+    def annotate_closest_ancestor_value(
+        self,
+        field,
+        *,
+        condition=None,
+        defined_when=None,
+        value_name=None,
+        source_name=None,
+        source_pk_name=None,
+        source_field="pk",
+    ):
+        """
+        Annotate each node with the most recent defined value on its path.
+
+        The node itself is included in the ancestor search. ``condition`` is a
+        Q object that identifies nodes with a definition. A matching node may
+        still have a NULL ``field`` value; that value is returned and prevents
+        higher ancestors from being used.
+
+        Candidate nodes are read from the base tree model using this
+        queryset's database alias, so filters, ordering and slicing on the
+        target queryset do not restrict or duplicate the source lookup.
+        """
+        if condition is not None and defined_when is not None:
+            raise ValueError("condition and defined_when are mutually exclusive")
+
+        condition = condition if condition is not None else defined_when
+        if source_name is not None and source_pk_name is not None and source_name != source_pk_name:
+            raise ValueError("source_name and source_pk_name are mutually exclusive")
+        source_name = source_name or source_pk_name
+
+        if not isinstance(condition, Q):
+            raise TypeError("condition must be a Q object")
+
+        tree_model = self.model.objects.tree_model
+        candidates = tree_model.objects.db_manager(self.db).all().order_by().filter(condition)
+
+        outer_path = OuterRef("path")
+        is_ancestor = (
+            Q(path=Substr(outer_path, 1, Length("path")))
+            & Q(depth__lte=OuterRef("depth"))
+            & Q(path_length=F("depth") * tree_model.steplen)
+        )
+        closest_candidates = (
+            candidates.alias(path_length=Length("path"))
+            .filter(is_ancestor)
+            .order_by("-depth", "-path")
+        )
+
+        field_name = field.name if isinstance(field, F) else field
+        value_name = value_name or f"inherited_{field_name}"
+        source_name = source_name or f"{value_name}_source"
+
+        return self.annotate(
+            **{
+                source_name: Subquery(closest_candidates.values(source_field)[:1]),
+                value_name: Subquery(closest_candidates.values(field_name)[:1]),
+            }
+        )
+
+    annotate_nearest_ancestor_value = annotate_closest_ancestor_value
+    annotate_inherited_value = annotate_closest_ancestor_value
 
 
 class MP_NodeManager(NodeManager):
