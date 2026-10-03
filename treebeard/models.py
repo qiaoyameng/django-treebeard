@@ -1,12 +1,13 @@
 """Models and base API"""
 
+import copy
 import operator
 import warnings
 from contextlib import suppress
 from functools import reduce
 
 from django.core import checks
-from django.db import models, transaction
+from django.db import models, router, transaction
 from django.db.models import Q
 from django.utils.functional import cached_property
 
@@ -485,6 +486,412 @@ class NodeManager(models.Manager):
             # extending the stack with the current node as the parent of the new nodes
             stack.extend([(node_obj, child) for child in deserialized_obj.children[::-1]])
         return added
+
+    def copy_subtree(
+        self,
+        node,
+        target=None,
+        pos="last-child",
+        *,
+        fields=None,
+        ignore_fields=(),
+        field_callbacks=None,
+        unique_callbacks=None,
+        external_references="reject",
+        copy_m2m=False,
+        using=None,
+    ):
+        """
+        Copy a node and all descendants.
+
+        Return a dictionary mapping original primary keys to the primary keys
+        of their copies.
+        """
+        using = using or router.db_for_write(self.tree_model, instance=node)
+        with transaction.atomic(using=using):
+            return self._copy_subtree(
+                node,
+                target,
+                pos,
+                fields=fields,
+                ignore_fields=ignore_fields,
+                field_callbacks=field_callbacks,
+                unique_callbacks=unique_callbacks,
+                external_references=external_references,
+                copy_m2m=copy_m2m,
+                using=using,
+            )
+
+    def _copy_subtree(
+        self,
+        node,
+        target=None,
+        pos="last-child",
+        *,
+        fields=None,
+        ignore_fields=(),
+        field_callbacks=None,
+        unique_callbacks=None,
+        external_references="reject",
+        copy_m2m=False,
+        using=None,
+    ):
+        external_references = {
+            "reject": "reject",
+            "raise": "reject",
+            "error": "reject",
+            "preserve": "preserve",
+            "keep": "preserve",
+        }.get(external_references)
+        if external_references is None:
+            raise ValueError("external_references must be either 'reject' or 'preserve'.")
+
+        if isinstance(fields, str) or not hasattr(fields, "items"):
+            copy_fields = (fields,) if isinstance(fields, str) else tuple(fields or ())
+            field_actions = {}
+        else:
+            copy_fields = ()
+            field_actions = {}
+            for field_name, action in fields.items():
+                if callable(action):
+                    field_actions[field_name] = "recompute"
+                    field_callbacks = dict(field_callbacks or {})
+                    field_callbacks[field_name] = action
+                else:
+                    field_actions[field_name] = action
+
+        ignore_fields = tuple(ignore_fields)
+        field_callbacks = dict(field_callbacks or {})
+        unique_callbacks = dict(unique_callbacks or {})
+
+        valid_actions = {"copy", "ignore", "recompute"}
+        for field_name, action in field_actions.items():
+            if action not in valid_actions:
+                raise ValueError(f"Unsupported copy action {action!r} for field {field_name!r}.")
+        for field_name in field_callbacks:
+            if not callable(field_callbacks[field_name]):
+                raise ValueError(f"The callback for field {field_name!r} must be callable.")
+        for field_name, callback in unique_callbacks.items():
+            if not callable(callback):
+                raise ValueError(f"The callback for unique field {field_name!r} must be callable.")
+
+        if isinstance(copy_m2m, str):
+            m2m_fields = {copy_m2m}
+        elif copy_m2m is True:
+            m2m_fields = None
+        elif copy_m2m is False:
+            m2m_fields = set()
+        else:
+            m2m_fields = set(copy_m2m)
+
+        tree_model = self.tree_model
+        mgr = self.db_manager(using)
+        sources = list(mgr.get_tree(node))
+        subtree_pks = {source.pk for source in sources}
+        internal_concrete_fields = {
+            source.__class__: tuple(
+                field
+                for field in source.__class__._meta.concrete_fields
+                if field.many_to_one and not field.remote_field.parent_link
+            )
+            for source in sources
+        }
+        source_refresh_fields = {
+            source.__class__: {
+                field.attname
+                for field in internal_concrete_fields.get(source.__class__, ())
+                if field.related_model in tree_model._meta.get_parent_list() + [tree_model]
+            }
+            for source in sources
+        }
+        for model_class, refresh_fields in source_refresh_fields.items():
+            if refresh_fields:
+                refreshed_sources = model_class._base_manager.using(using).filter(pk__in=subtree_pks).values(
+                    "pk", *refresh_fields
+                )
+                refreshed_values = {row["pk"]: row for row in refreshed_sources}
+                for source in sources:
+                    if source.__class__ == model_class:
+                        for field_name in refresh_fields:
+                            setattr(source, field_name, refreshed_values[source.pk][field_name])
+        source_by_pk = {source.pk: source for source in sources}
+
+        if target is not None and not isinstance(target, tree_model):
+            raise ValueError("The copy target must be a node of the same tree model.")
+
+        if target is not None and target._state.adding:
+            raise ValueError("The copy target must be saved before copying a subtree.")
+
+        if target is not None and target.pk in subtree_pks:
+            raise InvalidPosition("A subtree cannot be copied into itself.")
+
+        if target is None:
+            if pos not in ("first-sibling", "last-sibling", "sorted-sibling", None):
+                raise InvalidPosition("Root nodes can only be copied using a sibling position.")
+            pos = "sorted-sibling" if tree_model.node_order_by and pos is None else pos or "last-sibling"
+            if pos not in self._valid_pos_for_sorted_add_sibling and tree_model.node_order_by:
+                raise InvalidPosition("Must use sorted-sibling when node_order_by is enabled")
+            if pos in self._valid_pos_for_sorted_add_sibling and not tree_model.node_order_by:
+                raise MissingNodeOrderBy("Missing node_order_by attribute.")
+        else:
+            if pos is None:
+                pos = "sorted-child" if tree_model.node_order_by else "last-child"
+            self._prepare_pos_var_for_move(pos)
+
+        def tree_relation(field):
+            related_model = field.related_model
+            return (
+                field.remote_field is not None
+                and related_model is not None
+                and tree_model in related_model._meta.get_parent_list() + [related_model]
+            )
+
+        def structure_field(field):
+            return field.name in tree_model.MOVENODE_FORM_EXCLUDED_FIELDS or (
+                field.one_to_one
+                and field.remote_field.parent_link
+                and field.related_model in tree_model._meta.get_parent_list()
+            )
+
+        def field_policy(field):
+            if field.name in ignore_fields:
+                return "ignore"
+            if field.name in field_callbacks:
+                return "recompute"
+            if field.name in field_actions:
+                return field_actions[field.name]
+            if copy_fields and field.name not in copy_fields:
+                return "ignore"
+            return "copy"
+
+        clones = {}
+        original_parent_pks = {}
+        for source in sources:
+            clone = copy.copy(source)
+            clone.pk = None
+            clone.id = None
+            clone._state.adding = True
+            clone._state.db = using
+            clone._state.fields_cache = {}
+
+            for field in source.__class__._meta.concrete_fields:
+                if structure_field(field):
+                    setattr(clone, field.attname, field.get_default())
+
+            if source.parent_id is not None if hasattr(source, "parent_id") else False:
+                original_parent_pks[source.pk] = source.parent_id
+            elif source.depth > 1 if hasattr(source, "depth") else False:
+                original_parent_pks[source.pk] = mgr.get_parent(source).pk
+
+            for field in source.__class__._meta.concrete_fields:
+                if structure_field(field) or field.primary_key or field.many_to_many:
+                    continue
+
+                policy = field_policy(field)
+                if policy == "ignore":
+                    setattr(clone, field.attname, field.get_default())
+                elif policy == "recompute":
+                    if field.name not in field_callbacks:
+                        raise ValueError(f"Missing callback for field {field.name!r}.")
+                    setattr(clone, field.attname, field_callbacks[field.name](source))
+
+                if field.unique and not tree_relation(field):
+                    callback = unique_callbacks.get(field.name) or field_callbacks.get(field.name)
+                    if callback is None:
+                        raise ValueError(f"Missing callback for unique field {field.name!r}.")
+                    setattr(clone, field.attname, callback(source))
+
+                field_value = getattr(source, field.attname)
+                if tree_relation(field) and field.many_to_one and not field.remote_field.parent_link:
+                    if field_value in subtree_pks:
+                        setattr(clone, field.attname, None)
+                    elif field_value is not None and external_references != "preserve":
+                        raise ValueError(
+                            f"Cannot copy external reference {field.name!r} without an explicit policy."
+                        )
+                elif policy == "copy" and field.many_to_one:
+                    if (
+                        tree_relation(field)
+                        and field_value is not None
+                        and field_value not in subtree_pks
+                        and external_references == "reject"
+                    ):
+                        raise ValueError(f"Cannot copy external reference {field.name!r} without an explicit policy.")
+
+            if hasattr(clone, "numchild"):
+                clone.numchild = 0
+
+            with suppress(AttributeError):
+                del clone._cached_parent_obj
+            with suppress(AttributeError):
+                del clone._cached_depth
+
+            clones[source.pk] = clone
+
+        original_parent_pks.pop(node.pk, None)
+
+        m2m_sources = {}
+        custom_through_rows = {}
+        for source in sources:
+            for field in source.__class__._meta.many_to_many:
+                if m2m_fields is not None and field.name not in m2m_fields:
+                    continue
+
+                rel_field = field.remote_field
+                if rel_field.through._meta.auto_created:
+                    m2m_sources[(source.pk, field.name)] = list(
+                        getattr(source, field.name).using(using).values_list("pk", flat=True)
+                    )
+                else:
+                    custom_through_rows.setdefault(field, []).extend(
+                        list(
+                            rel_field.through._base_manager.using(using).filter(
+                                **{field.m2m_field_name(): source.pk}
+                            )
+                        )
+                    )
+
+        for rows in custom_through_rows.values():
+            for row in rows:
+                for field in row.__class__._meta.local_concrete_fields:
+                    if not field.many_to_one or field.primary_key:
+                        continue
+                    value = getattr(row, field.attname)
+                    if (
+                        value is not None
+                        and field.related_model in tree_model._meta.get_parent_list() + [tree_model]
+                        and value not in subtree_pks
+                        and external_references == "reject"
+                    ):
+                        raise ValueError("Cannot copy an external subtree reference without an explicit policy.")
+
+        def insert_clone(source, clone):
+            source_parent_pk = original_parent_pks.get(source.pk)
+            if source_parent_pk is None:
+                if target is None:
+                    if pos == "sorted-sibling":
+                        last_root = mgr.get_last_root_node()
+                        if last_root:
+                            return mgr.add_sibling(last_root, "sorted-sibling", instance=clone)
+                        return mgr.add_root(instance=clone)
+                    if pos == "first-sibling":
+                        first_root = mgr.get_first_root_node()
+                        if first_root:
+                            return mgr.add_sibling(first_root, "first-sibling", instance=clone)
+                        return mgr.add_root(instance=clone)
+                    return mgr.add_root(instance=clone)
+
+                if pos == "first-child":
+                    first_child = mgr.get_first_child(target)
+                    if first_child is None:
+                        return mgr.add_child(target, instance=clone)
+                    return mgr.add_sibling(first_child, "first-sibling", instance=clone)
+                if pos in ("last-child", "sorted-child"):
+                    return mgr.add_child(target, instance=clone)
+                return mgr.add_sibling(target, pos, instance=clone)
+
+            parent = clones[source_parent_pk]
+            return mgr.add_child(parent, instance=clone)
+
+        pk_map = {}
+        for source in sources:
+            new_node = insert_clone(source, clones[source.pk])
+            pk_map[source.pk] = new_node.pk
+
+        if target is not None:
+            target.refresh_from_db(using=using)
+
+        internal_fields = set()
+        for source in sources:
+            for field in source.__class__._meta.concrete_fields:
+                if (
+                    field.many_to_one
+                    and not field.remote_field.parent_link
+                    and not structure_field(field)
+                    and tree_relation(field)
+                ):
+                    internal_fields.add((source.__class__, field))
+
+        for model, field in internal_fields:
+            updates = []
+            for source in sources:
+                old_value = getattr(source, field.attname)
+                if old_value in pk_map:
+                    updates.append((pk_map[source.pk], pk_map[old_value]))
+            for new_pk, new_value in updates:
+                model._base_manager.using(using).filter(pk=new_pk).update(**{field.attname: new_value})
+
+        for (source_pk, field_name), target_pks in m2m_sources.items():
+            field = source_by_pk[source_pk].__class__._meta.get_field(field_name)
+            new_node = tree_model._base_manager.using(using).get(pk=pk_map[source_pk])
+            mapped_pks = []
+            for target_pk in target_pks:
+                if target_pk in pk_map:
+                    mapped_pks.append(pk_map[target_pk])
+                elif field.related_model not in tree_model._meta.get_parent_list() + [tree_model]:
+                    mapped_pks.append(target_pk)
+                elif external_references == "preserve":
+                    mapped_pks.append(target_pk)
+                else:
+                    raise ValueError("Cannot copy an external subtree reference without an explicit policy.")
+            getattr(new_node, field.name).using(using).add(*mapped_pks)
+
+        for field, rows in custom_through_rows.items():
+            through_model = field.remote_field.through
+            source_name = field.m2m_field_name()
+            target_name = field.m2m_reverse_field_name()
+            new_rows = []
+            seen = set()
+
+            for row in rows:
+                source_pk = getattr(row, f"{source_name}_id")
+                target_pk = getattr(row, f"{target_name}_id")
+                new_source_pk = pk_map.get(source_pk)
+                new_target_pk = pk_map.get(target_pk)
+                source_field = through_model._meta.get_field(source_name)
+                target_field = through_model._meta.get_field(target_name)
+                tree_models = tree_model._meta.get_parent_list() + [tree_model]
+                if new_source_pk is None:
+                    if source_field.related_model in tree_models and external_references != "preserve":
+                        raise ValueError("Cannot copy an external subtree reference without an explicit policy.")
+                    new_source_pk = source_pk
+                if new_target_pk is None:
+                    if target_field.related_model in tree_models and external_references != "preserve":
+                        raise ValueError("Cannot copy an external subtree reference without an explicit policy.")
+                    new_target_pk = target_pk
+
+                key = [new_source_pk, new_target_pk]
+                new_row = through_model()
+                setattr(new_row, f"{source_name}_id", new_source_pk)
+                setattr(new_row, f"{target_name}_id", new_target_pk)
+
+                for through_field in through_model._meta.local_concrete_fields:
+                    if through_field.primary_key or through_field.name in (source_name, target_name):
+                        continue
+                    value = getattr(row, through_field.attname)
+                    if through_field.many_to_one:
+                        if value in pk_map:
+                            value = pk_map[value]
+                        elif (
+                            value is not None
+                            and through_field.related_model in tree_models
+                            and external_references != "preserve"
+                        ):
+                            raise ValueError("Cannot copy an external subtree reference without an explicit policy.")
+                    setattr(new_row, through_field.attname, value)
+                    if not through_field.many_to_one:
+                        key.append((through_field.name, value))
+
+                key = tuple(key)
+                if key not in seen:
+                    seen.add(key)
+                    new_rows.append(new_row)
+
+            through_model._base_manager.using(using).bulk_create(
+                new_rows, ignore_conflicts=through_model._meta.auto_created
+            )
+
+        return pk_map
 
     def dump_bulk(self, parent=None, keep_ids=True):  # pragma: no cover
         """

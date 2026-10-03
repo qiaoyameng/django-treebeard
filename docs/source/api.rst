@@ -326,6 +326,21 @@ API
         tree = MyNodeModel.objects.dump_bulk()
         branch = MyNodeModel.objects.dump_bulk(node_obj)
 
+  .. automethod:: copy_subtree
+
+     Example:
+
+     .. code-block:: python
+
+        MyNodeModel.objects.copy_subtree(
+            source_node,
+            target_parent,
+            "last-child",
+            unique_callbacks={"code": lambda node: f"{node.code}-copy"},
+            external_references="preserve",
+            copy_m2m=True,
+        )
+
   .. automethod:: get_descendants_group_count
 
      Example:

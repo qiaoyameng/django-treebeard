@@ -103,6 +103,66 @@ class AL_TestNodeInherited(AL_TestNode):
     extra_desc = models.CharField(max_length=255)
 
 
+class MP_CopyNodeLink(models.Model):
+    source = models.ForeignKey("MP_CopyNode", related_name="+", on_delete=models.CASCADE)
+    target = models.ForeignKey("MP_CopyNode", related_name="+", on_delete=models.CASCADE)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["source", "target"], name="mp_copy_node_link_unique")]
+
+
+class MP_CopyNode(MP_Node):
+    steplen = 3
+    desc = models.CharField(max_length=255)
+    note = models.CharField(max_length=30, null=True, blank=True)
+    code = models.CharField(max_length=30, unique=True)
+    internal_ref = models.ForeignKey("self", null=True, on_delete=models.SET_NULL, related_name="+")
+    links = models.ManyToManyField("self", through=MP_CopyNodeLink, symmetrical=False, related_name="+")
+
+
+class NS_CopyNodeLink(models.Model):
+    source = models.ForeignKey("NS_CopyNode", related_name="+", on_delete=models.CASCADE)
+    target = models.ForeignKey("NS_CopyNode", related_name="+", on_delete=models.CASCADE)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["source", "target"], name="ns_copy_node_link_unique")]
+
+
+class NS_CopyNode(NS_Node):
+    desc = models.CharField(max_length=255)
+    note = models.CharField(max_length=30, null=True, blank=True)
+    code = models.CharField(max_length=30, unique=True)
+    internal_ref = models.ForeignKey("self", null=True, on_delete=models.SET_NULL, related_name="+")
+    links = models.ManyToManyField("self", through=NS_CopyNodeLink, symmetrical=False, related_name="+")
+
+
+class AL_CopyNodeLink(models.Model):
+    source = models.ForeignKey("AL_CopyNode", related_name="+", on_delete=models.CASCADE)
+    target = models.ForeignKey("AL_CopyNode", related_name="+", on_delete=models.CASCADE)
+    position = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["source", "target"], name="al_copy_node_link_unique")]
+
+
+class AL_CopyNode(AL_Node):
+    parent = models.ForeignKey(
+        "self",
+        related_name="children_set",
+        null=True,
+        db_index=True,
+        on_delete=models.CASCADE,
+    )
+    sib_order = models.PositiveIntegerField()
+    desc = models.CharField(max_length=255)
+    note = models.CharField(max_length=30, null=True, blank=True)
+    code = models.CharField(max_length=30, unique=True)
+    internal_ref = models.ForeignKey("self", null=True, on_delete=models.SET_NULL, related_name="+")
+    links = models.ManyToManyField("self", through=AL_CopyNodeLink, symmetrical=False, related_name="+")
+
+
 class MP_TestNodeSorted(MP_Node, DescMixin):
     steplen = 2
     node_order_by = ["val1", "val2", "-desc"]
@@ -200,6 +260,7 @@ SORTED_MODELS = [AL_TestNodeSorted, MP_TestNodeSorted, NS_TestNodeSorted]
 MP_MODELS = [MP_TestNode, MP_TestNodeUuid, MP_TestNodeCustomId]
 MP_SHORTPATH_MODELS = [MP_TestNodeShortPath, MP_TestSortedNodeShortPath]
 RELATED_MODELS = [AL_TestNodeRelated, MP_TestNodeRelated, NS_TestNodeRelated]
+COPY_MODELS = [AL_CopyNode, MP_CopyNode, NS_CopyNode]
 BENCHMARK_MODELS = [AL_TestNode, MP_TestNode, NS_TestNode]
 
 # Pairs of dependent models and base models that they depend on
@@ -243,6 +304,21 @@ if os.environ.get("DATABASE_ENGINE", "") == "psql":
 
     class LT_TestNodeRelated(LT_Node, DescMixin, RelatedNodeMixin): ...
 
+    class LT_CopyNodeLink(models.Model):
+        source = models.ForeignKey("LT_CopyNode", related_name="+", on_delete=models.CASCADE)
+        target = models.ForeignKey("LT_CopyNode", related_name="+", on_delete=models.CASCADE)
+        position = models.PositiveIntegerField(default=0)
+
+        class Meta:
+            constraints = [models.UniqueConstraint(fields=["source", "target"], name="lt_copy_node_link_unique")]
+
+    class LT_CopyNode(LT_Node):
+        desc = models.CharField(max_length=255)
+        note = models.CharField(max_length=30, null=True, blank=True)
+        code = models.CharField(max_length=30, unique=True)
+        internal_ref = models.ForeignKey("self", null=True, on_delete=models.SET_NULL, related_name="+")
+        links = models.ManyToManyField("self", through=LT_CopyNodeLink, symmetrical=False, related_name="+")
+
     class LT_TestNodeSomeDep(models.Model):
         node = models.ForeignKey(LT_TestNode, on_delete=models.CASCADE)
 
@@ -252,6 +328,7 @@ if os.environ.get("DATABASE_ENGINE", "") == "psql":
     INHERITED_MODELS.append((LT_TestNode, LT_TestNodeInherited))
     SORTED_MODELS.append(LT_TestNodeSorted)
     RELATED_MODELS.append(LT_TestNodeRelated)
+    COPY_MODELS.append(LT_CopyNode)
     INHERITED_MODELS_WITH_SORT.append((LT_TestNodeSorted, LT_TestNodeInheritedSorted))
     LT_BASE_MODELS.append(LT_TestNode)
     BENCHMARK_MODELS.append(LT_TestNode)

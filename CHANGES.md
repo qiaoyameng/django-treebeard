@@ -1,3 +1,10 @@
+Unreleased
+----------
+
+- Added `NodeManager.copy_subtree()` for copying a node and its descendants in a single
+  transaction, with callbacks for recalculated/unique fields, configurable external reference
+  handling, optional M2M copying, and an original-to-new primary key mapping.
+
 Release 7.0.2 (Sep 15, 2026)
 ----------------------------
 
