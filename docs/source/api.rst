@@ -398,5 +398,7 @@ API
 
   .. automethod:: get_annotated_list_qs
 
+  .. automethod:: get_visible_tree
+
 
 .. _django-mptt: https://github.com/django-mptt/django-mptt/

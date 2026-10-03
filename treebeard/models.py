@@ -2,12 +2,14 @@
 
 import operator
 import warnings
+from collections.abc import Iterable
 from contextlib import suppress
 from functools import reduce
 
 from django.core import checks
 from django.db import models, transaction
 from django.db.models import Q
+from django.utils.encoding import is_protected_type
 from django.utils.functional import cached_property
 
 from treebeard.deprecation import RemovedInTreebeard8Warning, get_moved_manager_classmethod, get_moved_manager_method
@@ -434,6 +436,220 @@ class NodeManager(models.Manager):
         if max_depth:
             qs = qs.filter(depth__lte=max_depth)
         return self.get_annotated_list_qs(qs)
+
+    def get_visible_tree(self, allowed, *, on_hidden="prune", max_depth=None):
+        """
+        Return a complete, read-only projection of a tree.
+
+        ``allowed`` may be a queryset or an iterable of primary keys. Every
+        primary key in the result is guaranteed to be in that set.
+
+        ``on_hidden`` selects the projection semantics:
+
+        * ``"prune"``: hide a disallowed node and all of its descendants.
+        * ``"promote"``: promote allowed descendants to their nearest allowed
+          ancestor.
+
+        ``max_depth`` is measured from the projected roots, starting at 1. It
+        defines a presentation boundary, not an authorization rule.
+
+        A sliced queryset cannot identify a complete tree and is rejected.
+
+        The returned mapping contains:
+
+        * ``roots``: projected root identifiers in DFS order.
+        * ``nodes``: serializable node records in projected DFS order.
+        * ``max_depth``: the requested projected depth limit, if any.
+        * ``max_visible_depth``: the greatest projected depth in the result.
+        * ``truncated``: whether one or more allowed branches end at
+          ``max_depth``.
+        * ``complete``: whether the input represents a non-paginated tree.
+
+        Each node record contains ``id``, ``parent``, ``depth``, ``numchild``,
+        ``open``, ``close``, ``truncated`` and ``fields``. ``open`` is true when
+        the node has visible children; ``close`` is the number of projected
+        levels that close before the next rendered node or at the end.
+        """
+        if on_hidden not in {"prune", "promote"}:
+            raise ValueError("on_hidden must be either 'prune' or 'promote'.")
+        if max_depth is not None and max_depth < 1:
+            raise ValueError("max_depth must be greater than or equal to 1.")
+
+        using = self._db
+        if isinstance(allowed, models.QuerySet):
+            if allowed.model is not self.model:
+                raise ValueError("allowed must be a queryset for this manager's model.")
+            if allowed.query.is_sliced:
+                raise ValueError("A sliced queryset does not represent a complete visible tree.")
+            using = allowed.db
+            allowed_qs = allowed.using(using)
+            if allowed_qs.query.is_empty():
+                return {
+                    "roots": [],
+                    "nodes": [],
+                    "max_depth": max_depth,
+                    "max_visible_depth": 0,
+                    "truncated": False,
+                    "complete": True,
+                }
+        elif isinstance(allowed, Iterable) and not isinstance(allowed, (str, bytes)):
+            allowed_pks = list(allowed)
+            if not allowed_pks:
+                return {
+                    "roots": [],
+                    "nodes": [],
+                    "max_depth": max_depth,
+                    "max_visible_depth": 0,
+                    "truncated": False,
+                    "complete": True,
+                }
+            allowed_qs = self.using(using).filter(pk__in=allowed_pks)
+        else:
+            raise TypeError("allowed must be a QuerySet or an iterable of primary keys.")
+
+        context = {"depth_by_pk": {}}
+        nodes = list(self._get_visible_tree_nodes(allowed_qs, context))
+        if not nodes:
+            return {
+                "roots": [],
+                "nodes": [],
+                "max_depth": max_depth,
+                "max_visible_depth": 0,
+                "truncated": False,
+                "complete": True,
+            }
+
+        allowed_pks = {node.pk for node in nodes if getattr(node, "treebeard_visible", False)}
+        projected = []
+        records_by_pk = {}
+        visible_stack = []
+        skip_hidden_subtree = False
+        skip_depth = None
+        truncated_pks = set()
+
+        for node in nodes:
+            original_depth = self._get_visible_tree_node_depth(node, context)
+            visible_stack = [item for item in visible_stack if item["depth"] < original_depth]
+
+            if skip_hidden_subtree:
+                if original_depth > skip_depth:
+                    continue
+                skip_hidden_subtree = False
+                skip_depth = None
+
+            if node.pk not in allowed_pks:
+                if on_hidden == "prune":
+                    skip_hidden_subtree = True
+                    skip_depth = original_depth
+                continue
+
+            projected_parent = visible_stack[-1] if visible_stack else None
+            projected_depth = projected_parent["projected_depth"] + 1 if projected_parent else 1
+
+            if max_depth is not None and projected_depth > max_depth:
+                if projected_parent:
+                    truncated_pks.add(projected_parent["pk"])
+                continue
+
+            record = {
+                "id": self._serialize_projected_pk(node),
+                "parent": projected_parent["id"] if projected_parent else None,
+                "depth": projected_depth,
+                "numchild": 0,
+                "open": False,
+                "close": 0,
+                "truncated": False,
+                "fields": self._serialize_projected_fields(node),
+            }
+            projected.append(record)
+            records_by_pk[node.pk] = record
+
+            stack_item = {
+                "pk": node.pk,
+                "depth": original_depth,
+                "projected_depth": projected_depth,
+                "id": record["id"],
+            }
+            visible_stack.append(stack_item)
+
+        if not projected:
+            return {
+                "roots": [],
+                "nodes": [],
+                "max_depth": max_depth,
+                "max_visible_depth": 0,
+                "truncated": False,
+                "complete": True,
+            }
+
+        child_counts = {record["id"]: 0 for record in projected}
+        for record in projected:
+            if record["parent"] is not None:
+                child_counts[record["parent"]] += 1
+        for record in projected:
+            record["numchild"] = child_counts[record["id"]]
+            record["truncated"] = record["id"] in {records_by_pk[pk]["id"] for pk in truncated_pks}
+            record["open"] = record["numchild"] > 0
+
+        close_counts = self._projection_close_counts(projected)
+        for record in projected:
+            record["close"] = close_counts[record["id"]]
+
+        roots = [record["id"] for record in projected if record["parent"] is None]
+        return {
+            "roots": roots,
+            "nodes": projected,
+            "max_depth": max_depth,
+            "max_visible_depth": max((record["depth"] for record in projected), default=0),
+            "truncated": bool(truncated_pks),
+            "complete": True,
+        }
+
+    def _projection_close_counts(self, records):
+        close_counts = {}
+        for current, following in zip(records, records[1:]):
+            close_counts[current["id"]] = max(0, current["depth"] - following["depth"])
+        close_counts[records[-1]["id"]] = records[-1]["depth"]
+        return close_counts
+
+    def _serialize_projected_pk(self, node):
+        pk_field = node._meta.pk
+        value = pk_field.value_from_object(node)
+        return value if value is None or is_protected_type(value) else pk_field.value_to_string(node)
+
+    def _serialize_projected_fields(self, node):
+        excluded = {"path", "depth", "numchild", "lft", "rgt", "tree_id", "parent", "sib_order"}
+        protected_as_string = {
+            "DateField",
+            "DateTimeField",
+            "TimeField",
+            "DurationField",
+            "DecimalField",
+        }
+        data = {}
+        for field in node._meta.concrete_fields:
+            if field.primary_key or field.name in excluded:
+                continue
+            if isinstance(field, models.ForeignKey):
+                value = getattr(node, field.attname)
+                data[field.name] = value if value is None or is_protected_type(value) else str(value)
+            elif field.get_internal_type() == "JSONField":
+                data[field.name] = field.value_from_object(node)
+            else:
+                value = field.value_from_object(node)
+                data[field.name] = (
+                    field.value_to_string(node)
+                    if value is not None
+                    and (not is_protected_type(value) or field.get_internal_type() in protected_as_string)
+                    else value
+                )
+        return data
+
+    def _get_visible_tree_node_depth(self, node, context):
+        return node.get_depth()
+
+    def _get_visible_tree_nodes(self, allowed_qs, context):  # pragma: no cover
+        raise NotImplementedError
 
     @transaction.atomic
     def load_bulk(self, bulk_data, parent=None, keep_ids=False):

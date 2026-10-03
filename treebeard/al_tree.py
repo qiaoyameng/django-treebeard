@@ -2,7 +2,7 @@
 
 from django.core import serializers
 from django.db import models, transaction
-from django.db.models import Exists, Max, Min, OuterRef
+from django.db.models import Case, Exists, Max, Min, OuterRef, Value, When
 from django.utils.translation import gettext_noop as _
 
 from treebeard.exceptions import InvalidMoveToDescendant
@@ -43,6 +43,36 @@ class AL_NodeManager(NodeManager):
 
         self._get_tree_recursively(results, parent, depth, max_depth=max_depth)
         return results
+
+    def _get_visible_tree_nodes(self, allowed_qs, context):
+        order_fields = ["parent"] + list(self.tree_model.node_order_by or ["sib_order"])
+        nodes = list(
+            self.tree_model.objects.using(allowed_qs.db)
+            .annotate(treebeard_visible=Exists(allowed_qs.order_by().filter(pk=OuterRef("pk"))))
+            .order_by(Case(When(parent__isnull=True, then=Value(0)), default=Value(1)), *order_fields)
+        )
+
+        roots = []
+        children_by_parent = {}
+        for node in nodes:
+            if node.parent_id is None:
+                roots.append(node)
+            else:
+                children_by_parent.setdefault(node.parent_id, []).append(node)
+
+        ordered = []
+        stack = [(node, 1) for node in reversed(roots)]
+        while stack:
+            node, depth = stack.pop()
+            context["depth_by_pk"][node.pk] = depth
+            ordered.append(node)
+            children = children_by_parent.get(node.pk, [])
+            for child in reversed(children):
+                stack.append((child, depth + 1))
+        return ordered
+
+    def _get_visible_tree_node_depth(self, node, context):
+        return context["depth_by_pk"][node.pk]
 
     def _get_tree_recursively(self, results, parent, depth, max_depth):
         if max_depth and depth > max_depth:

@@ -7,7 +7,7 @@ from typing import Any
 
 from django.core import serializers
 from django.db import connections, models, router, transaction
-from django.db.models import F, Func, OuterRef, Q, Subquery, Value
+from django.db.models import Exists, F, Func, OuterRef, Q, Subquery, Value
 from django.db.models.functions import Concat, Greatest, Length, Substr
 from django.dispatch import Signal
 from django.utils.translation import gettext_noop as _
@@ -121,6 +121,20 @@ class MP_NodeManager(NodeManager):
             filters["depth__lte"] = max_depth + (parent.depth if parent else 0)
 
         return cls.objects.filter(**filters)
+
+    def _get_visible_tree_nodes(self, allowed_qs, context):
+        allowed_qs = allowed_qs.order_by()
+        visible = Exists(allowed_qs.filter(pk=OuterRef("pk")))
+        has_allowed_descendant = Exists(allowed_qs.filter(path__startswith=OuterRef("path")))
+        return (
+            self.tree_model.objects.using(allowed_qs.db)
+            .annotate(
+                treebeard_visible=visible,
+                treebeard_has_allowed_descendant=has_allowed_descendant,
+            )
+            .filter(visible | has_allowed_descendant)
+            .order_by("path")
+        )
 
     def fix_tree(self, fix_paths=False, parent=None):
         """

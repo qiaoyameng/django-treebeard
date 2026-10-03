@@ -6,7 +6,7 @@ from itertools import groupby
 
 from django.core import serializers
 from django.db import models, transaction
-from django.db.models import Case, F, Q, When
+from django.db.models import Case, Exists, F, OuterRef, Q, When
 from django.dispatch import Signal
 from django.utils.translation import gettext_noop as _
 
@@ -108,6 +108,26 @@ class NS_NodeManager(NodeManager):
             filters["depth__lte"] = max_depth + (parent.depth if parent else 0)
 
         return cls.objects.filter(**filters)
+
+    def _get_visible_tree_nodes(self, allowed_qs, context):
+        allowed_qs = allowed_qs.order_by()
+        visible = Exists(allowed_qs.filter(pk=OuterRef("pk")))
+        has_allowed_descendant = Exists(
+            allowed_qs.filter(
+                tree_id=OuterRef("tree_id"),
+                lft__gt=OuterRef("lft"),
+                rgt__lt=OuterRef("rgt"),
+            )
+        )
+        return (
+            self.tree_model.objects.using(allowed_qs.db)
+            .annotate(
+                treebeard_visible=visible,
+                treebeard_has_allowed_descendant=has_allowed_descendant,
+            )
+            .filter(visible | has_allowed_descendant)
+            .order_by("tree_id", "lft")
+        )
 
     @transaction.atomic
     @check_create_args

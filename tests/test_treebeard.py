@@ -84,6 +84,10 @@ UNCHANGED = [
 ]
 
 
+def jsonable(value):
+    return str(value) if not isinstance(value, (int, float, bool, type(None), str)) else value
+
+
 @pytest.fixture(scope="function", params=models.BASE_MODELS + models.PROXY_MODELS)
 def model(request):
     request.param.objects.load_bulk(BASE_DATA)
@@ -489,6 +493,98 @@ class TestClassMethods(TestNonEmptyTree):
         expected = [("1", True, [0], 0)]
         with django_assert_max_num_queries(1):
             self._assert_get_annotated_list(model, expected, node)
+
+    def test_visible_tree_prunes_hidden_branch(self, model, django_assert_max_num_queries):
+        allowed_descs = ["2", "21", "231"]
+        hidden = model.objects.get(desc="23")
+        with django_assert_max_num_queries(1):
+            tree = model.objects.get_visible_tree(model.objects.filter(desc__in=allowed_descs))
+
+        pks = {node.desc: jsonable(node.pk) for node in model.objects.filter(desc__in=allowed_descs)}
+        json.dumps(tree)
+        assert tree["roots"] == [pks["2"]]
+        assert tree["max_visible_depth"] == 2
+        assert tree["complete"] is True
+        assert [
+            (node["fields"]["desc"], node["parent"], node["depth"], node["numchild"]) for node in tree["nodes"]
+        ] == [("2", None, 1, 1), ("21", pks["2"], 2, 0)]
+        assert all("path" not in node["fields"] for node in tree["nodes"])
+        assert all("depth" not in node["fields"] for node in tree["nodes"])
+        assert all("numchild" not in node["fields"] for node in tree["nodes"])
+        ids = {node["id"] for node in tree["nodes"]}
+        assert all(node["parent"] is None or node["parent"] in ids for node in tree["nodes"])
+        if issubclass(model, AL_Node):
+            assert not hasattr(hidden, "_cached_depth")
+
+        assert self.got(model) == UNCHANGED
+
+    def test_visible_tree_promotes_allowed_grandchildren(self, model, django_assert_max_num_queries):
+        allowed = model.objects.filter(desc__in=["2", "21", "231"])
+        with django_assert_max_num_queries(1):
+            tree = model.objects.get_visible_tree(allowed, on_hidden="promote")
+
+        pks = {node.desc: jsonable(node.pk) for node in model.objects.filter(desc__in=["2", "21", "231"])}
+        json.dumps(tree)
+        assert tree["roots"] == [pks["2"]]
+        assert tree["max_visible_depth"] == 2
+        assert tree["truncated"] is False
+        nodes = tree["nodes"]
+        assert [
+            (node["fields"]["desc"], node["id"], node["parent"], node["depth"], node["numchild"]) for node in nodes
+        ] == [
+            ("2", pks["2"], None, 1, 2),
+            ("21", pks["21"], pks["2"], 2, 0),
+            ("231", pks["231"], pks["2"], 2, 0),
+        ]
+        assert [node["open"] for node in nodes] == [True, False, False]
+        assert [node["close"] for node in nodes] == [0, 0, 2]
+        ids = {node["id"] for node in nodes}
+        assert all(node["parent"] is None or node["parent"] in ids for node in nodes)
+
+    def test_visible_tree_accepts_primary_keys_and_multiple_roots(self, model):
+        pks = {node.desc: node.pk for node in model.objects.all()}
+        allowed = [pks["1"], pks["21"], pks["231"], pks["41"]]
+        tree = model.objects.get_visible_tree(allowed, on_hidden="promote")
+        visible_pks = {desc: jsonable(pk) for desc, pk in pks.items()}
+
+        assert tree["roots"] == [
+            visible_pks["1"],
+            visible_pks["21"],
+            visible_pks["231"],
+            visible_pks["41"],
+        ]
+        assert tree["max_visible_depth"] == 1
+        assert [node["fields"]["desc"] for node in tree["nodes"]] == ["1", "21", "231", "41"]
+        assert [node["close"] for node in tree["nodes"]] == [0, 0, 0, 1]
+
+    def test_visible_tree_max_depth_is_a_boundary(self, model):
+        pks = {node.desc: node.pk for node in model.objects.all()}
+        tree = model.objects.get_visible_tree([pks["2"], pks["231"]], on_hidden="promote", max_depth=1)
+        root_id = jsonable(pks["2"])
+
+        assert tree["max_depth"] == 1
+        assert tree["max_visible_depth"] == 1
+        assert tree["truncated"] is True
+        assert tree["roots"] == [root_id]
+        assert [node["fields"]["desc"] for node in tree["nodes"]] == ["2"]
+        assert tree["nodes"][0]["numchild"] == 0
+        assert tree["nodes"][0]["truncated"] is True
+
+    def test_visible_tree_rejects_sliced_queryset(self, model):
+        with pytest.raises(ValueError, match="complete visible tree"):
+            model.objects.get_visible_tree(model.objects.all()[:10])
+
+    def test_visible_tree_rejects_invalid_mode(self, model):
+        with pytest.raises(ValueError, match="on_hidden"):
+            model.objects.get_visible_tree(model.objects.all(), on_hidden="invalid")
+
+    def test_visible_tree_prune_removes_explicitly_allowed_descendants(self, model):
+        pks = {node.desc: node.pk for node in model.objects.all()}
+        tree = model.objects.get_visible_tree([pks["23"], pks["231"]], on_hidden="prune")
+
+        assert tree["roots"] == []
+        assert tree["nodes"] == []
+        assert tree["max_visible_depth"] == 0
 
     def test_dump_bulk_node(self, model):
         node = model.objects.get(desc="231")
