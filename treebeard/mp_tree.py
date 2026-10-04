@@ -3,7 +3,7 @@
 import collections
 import warnings
 from functools import cache
-from typing import Any
+from typing import Any, NamedTuple
 
 from django.core import serializers
 from django.db import connections, models, router, transaction
@@ -13,13 +13,36 @@ from django.dispatch import Signal
 from django.utils.translation import gettext_noop as _
 
 from treebeard.deprecation import RemovedInTreebeard8Warning
-from treebeard.exceptions import InvalidMoveToDescendant, PathOverflow
+from treebeard.exceptions import InvalidMoveToDescendant, InvalidPosition, PathOverflow
 from treebeard.models import Node, NodeManager
 from treebeard.numconv import NumConv
 from treebeard.utils import check_create_args, prepare_dumpdata_for_loading, save_m2m
 
 path_updated = Signal()
 nodes_deleted = Signal()
+
+
+class BulkMoveResult(NamedTuple):
+    """
+    Describes where a single node ended up after a :meth:`MP_NodeManager.move_bulk`
+    operation. Results are returned in the same order as the requested moves.
+
+    Attributes:
+        node_pk: Primary key of the moved node.
+        parent_pk: Primary key of its final parent, or ``None`` for a root node.
+        new_path: Final materialized path of the node.
+        depth: Final depth of the node.
+        sibling_index: 1-indexed position amongst its final siblings.
+        moved: ``False`` when the request was a no-op (the node was already in
+            the requested place); ``True`` otherwise.
+    """
+
+    node_pk: Any
+    parent_pk: Any
+    new_path: str
+    depth: int
+    sibling_index: int
+    moved: bool
 
 
 class MP_NodeQuerySet(models.query.QuerySet):
@@ -578,6 +601,660 @@ class MP_NodeManager(NodeManager):
 
         return target, newdepth, siblings, newpos, pos
 
+    @transaction.atomic
+    def move_bulk(self, moves):
+        """
+        Moves several nodes (and all their descendants) to new positions in a
+        single, atomic operation.
+
+        Unlike issuing several :meth:`move` calls, the final tree state is
+        planned and validated up front from the *resulting* relationships, so
+        the caller never has to guess an execution order. Cases that are legal
+        in the final tree but impossible to reach with sequential single moves
+        (e.g. swapping two subtrees, or moving a node under a node that is
+        itself moved) are supported.
+
+        :param moves: An iterable of move descriptions. Each description is a
+            dict with the keys:
+
+            - ``node``: the node (instance or primary key) to move.
+            - ``target``: the reference node (instance or primary key), or
+              ``None`` to place the node at root level.
+            - ``pos``: one of ``first-child``, ``last-child``,
+              ``first-sibling``, ``last-sibling``, ``left``, ``right`` (or the
+              ``sorted-*`` equivalents when :attr:`node_order_by` is set).
+              Defaults to ``last-sibling``.
+
+            When several moves resolve to the same final slot, they are placed
+            in the order in which they appear in ``moves``.
+
+        :returns: A list of :class:`BulkMoveResult` objects, one per requested
+            move, in the same order.
+
+        :raise InvalidPosition: when a node is listed more than once, a target
+           or node does not exist, relative anchors cannot be resolved, or an
+           invalid ``pos`` is passed.
+        :raise InvalidMoveToDescendant: when the final state moves a node under
+           one of its own descendants.
+        :raise PathOverflow: when the final state exceeds the path capacity.
+
+        The whole batch is validated before any row is written, and any failure
+        rolls the entire transaction back. On success, the in-memory instances
+        passed in as ``node``/``target`` are refreshed from the database
+        (including their cached parent); node objects not passed in must be
+        re-fetched. :data:`path_updated` is sent once per physically relocated
+        subtree, but only after the transaction has been committed.
+        """
+        cls = self.tree_model
+        using = self._db or router.db_for_write(cls)
+
+        plan, instances = self._build_move_bulk_plan(moves, using)
+
+        # ---- write phase: park every subtree at an unused root-level step,
+        # then drop each subtree onto its final path. This staging pass makes
+        # the order of writes irrelevant for the unique path constraint, so
+        # swaps and other permutations never hit temporary conflicts.
+        net_changes = []  # (old_path, new_path)
+
+        staged = {}  # node_pk -> (original_path, staging_path)
+        for node_pk in plan["stage_order"]:
+            original_path = plan["original_paths"][node_pk]
+            staging_path = plan["staging_paths"][node_pk]
+            self._rewrite_subtree_paths(original_path, staging_path, using=using)
+            staged[node_pk] = (original_path, staging_path)
+
+        for group in plan["affected_groups"]:
+            for node_pk in group["final_children"]:
+                if node_pk not in staged:
+                    # kept its slot: nothing to write
+                    continue
+                staging_path = staged[node_pk][1]
+                final_path = plan["final_paths"][node_pk]
+                self._rewrite_subtree_paths(staging_path, final_path, using=using)
+                net_changes.append((plan["original_paths"][node_pk], final_path))
+
+        for parent_pk, numchild in plan["numchild_updates"].items():
+            cls.objects.using(using).filter(pk=parent_pk).update(numchild=numchild)
+
+        # Refresh the node/target instances the caller is holding so their
+        # path/depth/numchild/_cached_parent_obj are consistent with the DB.
+        refreshed = {}
+        for node_pk, instance in instances.items():
+            if node_pk in refreshed:
+                continue
+            instance.refresh_from_db(using=using)
+            refreshed[node_pk] = instance
+
+        # Signals describe only the net change (old committed path -> new path),
+        # never the temporary staging paths, and are emitted post-commit.
+        net_changes.sort(key=lambda change: len(change[0]), reverse=True)
+
+        def _send_path_signals():
+            for old_path, new_path in net_changes:
+                path_updated.send(sender=cls, old_path=old_path, new_path=new_path, using=using)
+
+        transaction.on_commit(_send_path_signals)
+
+        return plan["results"]
+
+    # ------------------------------------------------------------------
+    # Bulk move planning
+    # ------------------------------------------------------------------
+
+    def _build_move_bulk_plan(self, moves, using):
+        """
+        Validates the requested batch against the *final* tree state and builds
+        the write plan. No rows are modified here.
+        """
+        cls = self.tree_model
+        child_positions = ("first-child", "last-child", "sorted-child")
+        root_positions = ("first-sibling", "last-sibling", "sorted-sibling")
+
+        normalized = []
+        self_relative_noops = set()
+        instances = {}
+        seen_node_pks = set()
+        required_pks = set()
+
+        for move in moves:
+            if not isinstance(move, dict) or set(move) - {"node", "target", "pos"}:
+                raise InvalidPosition("Each move must be a dict with 'node', 'target' and 'pos' keys.")
+            if "node" not in move:
+                raise InvalidPosition("Each move must specify the 'node' to move.")
+
+            node_ref = move["node"]
+            target_ref = move.get("target")
+            pos = self._prepare_pos_var_for_move(move.get("pos"))
+
+            node_pk = node_ref.pk if isinstance(node_ref, cls) else node_ref
+            if node_pk is None:
+                raise InvalidPosition("Cannot move a node that was not saved to the database.")
+            if node_pk in seen_node_pks:
+                raise InvalidPosition(f"Node {node_pk} is listed more than once in the batch.")
+            seen_node_pks.add(node_pk)
+            required_pks.add(node_pk)
+            if isinstance(node_ref, cls):
+                instances[node_pk] = node_ref
+
+            target_pk = None
+            if isinstance(target_ref, cls):
+                target_pk = target_ref.pk
+                instances.setdefault(target_pk, target_ref)
+            elif target_ref is not None:
+                target_pk = target_ref
+            if target_pk is not None:
+                required_pks.add(target_pk)
+            elif pos not in root_positions:
+                raise InvalidPosition(f"Cannot position a root node with '{pos}'.")
+
+            if target_pk == node_pk and pos in child_positions:
+                raise InvalidMoveToDescendant(_("Can't move node to itself."))
+            if target_pk == node_pk and pos in ("left", "right"):
+                # left/right of oneself never changes anything
+                self_relative_noops.add(node_pk)
+
+            normalized.append({"node_pk": node_pk, "target_pk": target_pk, "pos": pos})
+
+        if not normalized:
+            return (
+                {
+                    "results": [],
+                    "stage_order": [],
+                    "staging_paths": {},
+                    "original_paths": {},
+                    "final_paths": {},
+                    "affected_groups": [],
+                    "numchild_updates": {},
+                },
+                instances,
+            )
+
+        # Lock every node taking part in the batch so a concurrent editor
+        # cannot change parent/position while the plan is being applied.
+        list(cls.objects.using(using).select_for_update().filter(pk__in=required_pks))
+        nodes = self._load_node_data(cls, using, required_pks)
+        missing = required_pks - set(nodes)
+        if missing:
+            raise InvalidPosition(f"Nodes not found: {sorted(missing, key=str)}")
+
+        # Cache of pk -> (path, depth) for stationary nodes inspected while
+        # walking parents during cycle detection.
+        extra_cache = {}
+
+        def get_data(pk):
+            if pk in nodes:
+                return nodes[pk]
+            return extra_cache.setdefault(pk, self._load_node_data(cls, using, [pk])[pk])
+
+        def current_parent_pk(pk):
+            data = get_data(pk)
+            if data["depth"] == 1:
+                return None
+            parent_path = cls._get_parent_path_from_path(data["path"])
+            return self._pk_for_path(cls, using, parent_path)
+
+        move_by_pk = {move["node_pk"]: move for move in normalized}
+
+        # Final parent pk of every moved node (None = root level).
+        #
+        # A *child* placement points straight at its target. A *sibling*
+        # placement points at the target's parent: a stationary target keeps
+        # its current parent, while a moved target defers to that target's own
+        # final parent ("sibling-of" placeholder). Following those placeholders
+        # reaches either a concrete parent, or a loop of sibling references
+        # (e.g. two roots swapping). Such a loop is legal and every member
+        # shares the concrete parent that the loop's moves point back into.
+        final_parent = {}
+        for move in normalized:
+            node_pk, target_pk, pos = move["node_pk"], move["target_pk"], move["pos"]
+            if pos in child_positions:
+                final_parent[node_pk] = target_pk
+            elif target_pk is None:
+                final_parent[node_pk] = None
+            elif target_pk not in seen_node_pks:
+                final_parent[node_pk] = current_parent_pk(target_pk)
+            else:
+                final_parent[node_pk] = ("sibling-of", target_pk)
+
+        def resolve_parent(start_pk):
+            """
+            Follows sibling-of placeholders until a concrete parent is
+            reached. Returns ``(parent_pk, loop)``; ``loop`` is the list of
+            members only when the references close into a pure sibling loop
+            (legal: they share one parent group).
+            """
+            order = []
+            seen = set()
+            pk = start_pk
+            while True:
+                value = final_parent[pk]
+                if not (isinstance(value, tuple) and value[0] == "sibling-of"):
+                    return value, None
+                if pk in seen:
+                    return None, order[order.index(pk):]
+                seen.add(pk)
+                order.append(pk)
+                pk = value[1]
+
+        # Resolve everything that leads (possibly through other moved nodes) to
+        # a concrete parent. Pure sibling loops are resolved afterwards.
+        for node_pk in list(final_parent):
+            if not isinstance(final_parent[node_pk], tuple):
+                continue
+            parent_pk, loop = resolve_parent(node_pk)
+            if loop is None:
+                final_parent[node_pk] = parent_pk
+
+        # Remaining placeholders belong to sibling loops (e.g. a root swap).
+        # All members share the parent of the first loop member whose target is
+        # stationary or root-level; root-level is the default for a closed loop.
+        while any(isinstance(value, tuple) for value in final_parent.values()):
+            member = next(pk for pk, value in final_parent.items() if isinstance(value, tuple))
+            _parent, loop = resolve_parent(member)
+            shared_parent = None
+            for loop_pk in loop:
+                target_pk = move_by_pk[loop_pk]["target_pk"]
+                if target_pk is None:
+                    shared_parent = None
+                    break
+                if target_pk not in seen_node_pks:
+                    shared_parent = current_parent_pk(target_pk)
+                    break
+            for loop_pk in loop:
+                final_parent[loop_pk] = shared_parent
+
+        # Walk each node's final ancestry. A node ending up under its own
+        # subtree is a cycle, even when its ancestor is a stationary node whose
+        # current path happens to sit below it.
+        path_cache = {pk: nodes[pk]["path"] for pk in nodes}
+
+        def path_of(pk):
+            if pk in path_cache:
+                return path_cache[pk]
+            return extra_cache.setdefault(pk, self._load_node_data(cls, using, [pk])[pk])["path"]
+
+        for move in normalized:
+            node_pk = move["node_pk"]
+            node_path = nodes[node_pk]["path"]
+            ancestor_pk = final_parent[node_pk]
+            visited = set()
+            while ancestor_pk is not None:
+                if ancestor_pk == node_pk:
+                    raise InvalidMoveToDescendant(_("Can't move node to a descendant."))
+                if ancestor_pk in visited:
+                    raise InvalidMoveToDescendant(_("Can't move node to a descendant."))
+                visited.add(ancestor_pk)
+                if ancestor_pk not in seen_node_pks:
+                    # Stationary ancestor: it keeps its current subtree, so if
+                    # it currently sits under the moved node the final state
+                    # would put the node under one of its own descendants.
+                    ancestor_path = path_of(ancestor_pk)
+                    if ancestor_path.startswith(node_path):
+                        raise InvalidMoveToDescendant(_("Can't move node to a descendant."))
+                    break
+                # Moved ancestor: keep walking final-parent edges; a closed loop
+                # (caught by `visited`) is the only possible cycle here.
+                ancestor_pk = final_parent[ancestor_pk]
+
+        # Final sibling groups -----------------------------------------
+        affected_parent_pks = set()
+        for move in normalized:
+            node_pk = move["node_pk"]
+            affected_parent_pks.add(None if nodes[node_pk]["depth"] == 1 else current_parent_pk(node_pk))
+            affected_parent_pks.add(final_parent[node_pk])
+
+        old_children = {}
+        child_data = {}
+        for parent_pk in affected_parent_pks:
+            children = self._load_children(cls, using, parent_pk, extra_cache)
+            old_children[parent_pk] = [child["pk"] for child in children]
+            for child in children:
+                child_data[child["pk"]] = child
+
+        final_groups = {}
+        for parent_pk in affected_parent_pks:
+            ordered = [
+                pk
+                for pk in old_children[parent_pk]
+                if pk not in seen_node_pks or pk in self_relative_noops
+            ]
+            pending = []
+            for move in normalized:
+                if final_parent[move["node_pk"]] != parent_pk:
+                    continue
+                node_pk, target_pk, pos = move["node_pk"], move["target_pk"], move["pos"]
+                if node_pk in self_relative_noops:
+                    # left/right of oneself never changes the tree
+                    continue
+                if pos in ("first-child", "first-sibling"):
+                    ordered.insert(0, node_pk)
+                elif pos in ("last-child", "last-sibling"):
+                    ordered.append(node_pk)
+                else:  # left / right / sorted-* (sorted positions are reordered below)
+                    pending.append(move)
+
+            if cls.node_order_by:
+                for move in pending:
+                    if move["pos"].startswith("sorted") and move["node_pk"] not in ordered:
+                        ordered.append(move["node_pk"])
+                data_for_sort = {}
+                data_for_sort.update(child_data)
+                data_for_sort.update(nodes)
+                rank = {pk: i for i, pk in enumerate(ordered)}
+                ordered = self._sort_sorted_group(cls, ordered, data_for_sort, rank)
+                pending = [move for move in pending if move["pos"] in ("left", "right")]
+
+            # Resolve left/right anchors to a concrete index. Every moved node
+            # is placed exactly once; anchors may be stationary, already placed
+            # by a positional move, or another pending node. Input order breaks
+            # ties and makes placements deterministic.
+            unresolved = pending
+            while unresolved:
+                still_unresolved = []
+                progressed = False
+                for move in unresolved:
+                    node_pk, target_pk, pos = move["node_pk"], move["target_pk"], move["pos"]
+                    if target_pk in ordered:
+                        if node_pk in ordered:
+                            ordered.remove(node_pk)
+                        index = ordered.index(target_pk)
+                        ordered.insert(index + 1 if pos == "right" else index, node_pk)
+                        progressed = True
+                    else:
+                        still_unresolved.append(move)
+                if not progressed:
+                    raise InvalidPosition(
+                        "Could not resolve a relative move: the target sibling must end up in the same group."
+                    )
+                unresolved = still_unresolved
+
+            final_groups[parent_pk] = {
+                "parent_pk": parent_pk,
+                "old_children": old_children[parent_pk],
+                "final_children": ordered,
+            }
+
+        plan = self._finalize_move_bulk_plan(
+            cls, using, normalized, nodes, final_parent, final_groups, extra_cache
+        )
+        return plan, instances
+
+    def _load_node_data(self, cls, using, pks):
+        values = (
+            cls.objects.using(using)
+            .filter(pk__in=pks)
+            .values("pk", "path", "depth", *cls._bulk_order_field_names())
+        )
+        return {obj["pk"]: obj for obj in values}
+
+    def _pk_for_path(self, cls, using, path):
+        return cls.objects.using(using).filter(path=path).values_list("pk", flat=True).first()
+
+    def _load_children(self, cls, using, parent_pk, extra_cache):
+        if parent_pk is None:
+            return list(cls.objects.using(using).filter(depth=1).order_by("path").values(
+                "pk", "path", "depth", *cls._bulk_order_field_names()
+            ))
+        if parent_pk not in extra_cache:
+            parent = cls.objects.using(using).filter(pk=parent_pk).values("path", "depth").first()
+            if parent is None:
+                raise InvalidPosition(f"Parent node {parent_pk} not found.")
+            extra_cache[parent_pk] = parent
+        parent = extra_cache[parent_pk]
+        parent_path = parent["path"]
+        interval = cls._get_children_path_interval(parent_path)
+        return list(
+            cls.objects.using(using)
+            .filter(depth=parent["depth"] + 1, path__range=interval)
+            .order_by("path")
+            .values("pk", "path", "depth", *cls._bulk_order_field_names())
+        )
+
+    def _sort_sorted_group(self, cls, ordered, data_by_pk, fallback_rank):
+        """
+        Returns ``ordered`` sorted by ``node_order_by`` (Django semantics:
+        nulls first, ascending unless the field is prefixed with ``-``),
+        keeping the pre-existing relative order on ties.
+        """
+        import functools
+
+        fields = [(f[1:] if f.startswith("-") else f, f.startswith("-")) for f in cls.node_order_by]
+
+        @functools.cmp_to_key
+        def compare(pk_a, pk_b):
+            data_a, data_b = data_by_pk[pk_a], data_by_pk[pk_b]
+            for name, descending in fields:
+                value_a = data_a.get(name)
+                value_b = data_b.get(name)
+                if value_a is None and value_b is None:
+                    continue
+                if value_a is None:
+                    return -1
+                if value_b is None:
+                    return 1
+                if value_a == value_b:
+                    continue
+                less = value_a < value_b
+                return -1 if (less != descending) else 1
+            return -1 if fallback_rank[pk_a] < fallback_rank[pk_b] else 1
+
+        return sorted(ordered, key=compare)
+
+    def _finalize_move_bulk_plan(self, cls, using, normalized, nodes, final_parent, final_groups, extra_cache):
+        """
+        Turns the final sibling groups into concrete paths, performs the
+        ordering/path-capacity checks and chooses root-level staging paths that
+        never collide with current or final root positions.
+        """
+        moved_pks = {move["node_pk"] for move in normalized}
+
+        affected_groups = [
+            group
+            for group in final_groups.values()
+            if group["old_children"] != group["final_children"]
+        ]
+
+        # Final paths are computed in order of *final* parent depth, so a moved
+        # parent already has its final path when a child group is processed.
+        final_paths = {}
+
+        def final_depth_of_parent(parent_pk, chain=None):
+            if parent_pk is None:
+                return 0
+            if parent_pk in final_paths:
+                return len(final_paths[parent_pk]) // cls.steplen
+            if parent_pk in moved_pks:
+                # Sorting by current depth would be wrong if it changes depth,
+                # so compute its final depth through the final-parent chain.
+                chain = chain or set()
+                if parent_pk in chain:
+                    raise InvalidMoveToDescendant(_("Can't move node to a descendant."))
+                chain.add(parent_pk)
+                return final_depth_of_parent(final_parent[parent_pk], chain) + 1
+            if parent_pk in extra_cache:
+                return extra_cache[parent_pk]["depth"]
+            return nodes[parent_pk]["depth"]
+
+        affected_groups.sort(key=lambda group: final_depth_of_parent(group["parent_pk"]))
+
+        for group in affected_groups:
+            parent_pk = group["parent_pk"]
+            if parent_pk is None:
+                parent_path = ""
+            elif parent_pk in final_paths:
+                # Includes both moved parents and stationary parents that were
+                # reshuffled inside an affected sibling group.
+                parent_path = final_paths[parent_pk]
+            else:
+                parent_data = extra_cache.get(parent_pk) or nodes.get(parent_pk)
+                if parent_data is None:
+                    parent_data = self._load_node_data(cls, using, [parent_pk])[parent_pk]
+                    extra_cache[parent_pk] = parent_data
+                parent_path = parent_data["path"]
+            parent_depth = len(parent_path) // cls.steplen
+            for index, child_pk in enumerate(group["final_children"], start=1):
+                final_paths[child_pk] = cls._get_path(parent_path, parent_depth + 1, index)
+
+        # Original paths of every subtree that genuinely changes path. Only
+        # those are parked at root level, keeping the required free slots to a
+        # minimum (a two-subtree swap needs just two free root codes).
+        stage_roots = []
+        original_paths = {}
+        for group in affected_groups:
+            for child_pk in group["final_children"]:
+                if child_pk in nodes:
+                    old_path = nodes[child_pk]["path"]
+                elif child_pk in extra_cache:
+                    old_path = extra_cache[child_pk]["path"]
+                else:
+                    old_path = cls.objects.using(using).values_list("path", flat=True).get(pk=child_pk)
+                original_paths[child_pk] = old_path
+                # A subtree is only relocated when its final path differs
+                # from its current path; children that keep their slot are
+                # left in place, which keeps the number of staging codes to a
+                # minimum (a two-subtree swap needs just two free codes).
+                if final_paths[child_pk] == old_path:
+                    continue
+                stage_roots.append((len(old_path) // cls.steplen, old_path, child_pk))
+
+        # ---- path capacity checks against the final state -------------
+        max_length = cls._meta.get_field("path").max_length
+        max_step = len(cls.alphabet) ** cls.steplen - 1
+        longest_suffix = self._longest_descendant_suffixes(cls, using, [item[1] for item in stage_roots])
+
+        for _d, _o, child_pk in stage_roots:
+            final_path = final_paths[child_pk]
+            step_value = cls._str2int(final_path[-cls.steplen :])
+            if step_value > max_step:
+                raise PathOverflow(_(f"Path Overflow from: '{final_path}'"))
+            if len(final_path) + longest_suffix[original_paths[child_pk]] > max_length:
+                raise PathOverflow(
+                    _(
+                        "The new node is too deep in the tree, try"
+                        " increasing the path.max_length property"
+                        " and UPDATE your database"
+                    )
+                )
+
+        # ---- reserve staging paths ------------------------------------
+        # Every relocated subtree is parked on a fresh root-level step that is
+        # unused by both the current roots and every final root position, so
+        # the unique path constraint can never observe a temporary collision
+        # regardless of write order. Only subtrees whose path actually changes
+        # are parked, so a swap of two subtrees needs just two free codes.
+        live_root_codes = {
+            cls._str2int(path[-cls.steplen :])
+            for path in cls.objects.using(using).filter(depth=1).values_list("path", flat=True)
+        }
+        final_root_codes = set()
+        for group in affected_groups:
+            if group["parent_pk"] is None:
+                final_root_codes.update(range(1, len(group["final_children"]) + 1))
+        forbidden_root_codes = live_root_codes | final_root_codes
+
+        staging_paths = {}
+        next_code = max(forbidden_root_codes) + 1 if forbidden_root_codes else 1
+        # A materialized-path tree always needs a free slot to move through,
+        # exactly like the single move() API: a namespace that cannot provide
+        # enough temporary codes raises PathOverflow.
+        ordered_stage_roots = sorted(stage_roots, key=lambda item: (-item[0], item[1]))
+        for _d, old_path, child_pk in ordered_stage_roots:
+            while next_code <= max_step and next_code in forbidden_root_codes:
+                next_code += 1
+            if next_code > max_step:
+                # No free root-level slot to park the subtree. Materialized
+                # paths always need a temporary free position to move through,
+                # exactly like the single move() API: a fully packed namespace
+                # cannot be permuted without raising PathOverflow.
+                raise PathOverflow(_("Path Overflow while staging subtrees for the bulk move."))
+            staging_paths[child_pk] = cls._get_path("", 1, next_code)
+            forbidden_root_codes.add(next_code)
+            next_code += 1
+
+        numchild_updates = {
+            group["parent_pk"]: len(group["final_children"])
+            for group in affected_groups
+            if group["parent_pk"] is not None
+        }
+
+        results = []
+        for move in normalized:
+            node_pk = move["node_pk"]
+            parent_pk = final_parent[node_pk]
+            # A node whose requested position matches its current position is
+            # a no-op: it never enters an affected group and keeps its path.
+            final_path = final_paths.get(node_pk, nodes[node_pk]["path"])
+            group_children = final_groups[parent_pk]["final_children"]
+            if node_pk in group_children:
+                index = group_children.index(node_pk) + 1
+            else:
+                # unaffected group: report the node's current sibling position
+                index = cls._str2int(nodes[node_pk]["path"][-cls.steplen :])
+            results.append(
+                BulkMoveResult(
+                    node_pk=node_pk,
+                    parent_pk=parent_pk,
+                    new_path=final_path,
+                    depth=len(final_path) // cls.steplen,
+                    sibling_index=index,
+                    moved=original_paths.get(node_pk, nodes[node_pk]["path"]) != final_path,
+                )
+            )
+
+        plan = {
+            "results": results,
+            "stage_order": [
+                child_pk
+                for _d, _o, child_pk in sorted(stage_roots, key=lambda item: (-item[0], item[1]))
+                if child_pk in staging_paths
+            ],
+            "staging_paths": staging_paths,
+            "original_paths": original_paths,
+            "final_paths": final_paths,
+            "affected_groups": affected_groups,
+            "numchild_updates": numchild_updates,
+        }
+        return plan
+
+    def _longest_descendant_suffixes(self, cls, using, root_paths):
+        """
+        :returns: a mapping ``root_path -> length of the longest path suffix
+                  inside that subtree that moves *with* it. Descendants that
+                  are themselves staged roots (a separately moved subtree) are
+                  excluded, since they carry their own capacity check.
+        """
+        root_set = set(root_paths)
+        result = {path: 0 for path in root_paths}
+        if not root_set:
+            return result
+
+        condition = Q()
+        for path in root_set:
+            condition |= Q(path__startswith=path)
+        rows = (
+            cls.objects.using(using)
+            .filter(condition)
+            .annotate(path_len=Length("path"))
+            .values_list("path", "path_len")
+        )
+        # A node belongs to the longest staged-root prefix that encloses it.
+        # Roots are unique paths with fixed step length, so checking the roots
+        # whose length is <= the path's length (longest first) is sufficient.
+        roots_by_len = collections.defaultdict(list)
+        for root in root_set:
+            roots_by_len[len(root)].append(root)
+        for path, length in rows:
+            nearest = path if path in root_set else None
+            if nearest is None:
+                for root_len in sorted((size for size in roots_by_len if size < length), reverse=True):
+                    prefix = path[:root_len]
+                    if prefix in root_set:
+                        nearest = prefix
+                        break
+            if nearest is not None:
+                result[nearest] = max(result[nearest], length - len(nearest))
+        return result
+
     def get_root_nodes(self):
         """:returns: A queryset containing the root nodes in the tree."""
         return self.tree_model.objects.filter(depth=1).order_by("path")
@@ -834,14 +1511,18 @@ class MP_NodeManager(NodeManager):
             self._set_newpath_in_branches(tempnewpath or oldpath, newpath)
         return oldpath, newpath
 
-    def _set_newpath_in_branches(self, oldpath, newpath):
+    def _rewrite_subtree_paths(self, oldpath, newpath, using=None, emit_signal=False):
         """
-        .. note::
+        Rewrites ``oldpath`` (and every descendant path) to ``newpath`` in a
+        single UPDATE statement, also adjusting ``depth`` when the path length
+        changes.
 
-           The query will only update depth values if needed.
+        :param emit_signal: When True, sends :data:`path_updated` immediately.
+            Bulk operations pass False here and send their own signals only
+            after the surrounding transaction has been committed.
 
+        :returns: The alias of the database the update ran on.
         """
-
         new_path_value = Concat(Value(newpath), Substr("path", len(oldpath) + 1))
         update_kwargs = {}
 
@@ -859,10 +1540,23 @@ class MP_NodeManager(NodeManager):
         update_kwargs["path"] = new_path_value
 
         model = self.tree_model
-        queryset = model.objects.filter(path__startswith=oldpath)
+        queryset = model.objects.using(using).filter(path__startswith=oldpath) if using else model.objects.filter(
+            path__startswith=oldpath
+        )
         update_count = queryset.update(**update_kwargs)
-        if update_count > 0:
-            path_updated.send(sender=model, old_path=oldpath, new_path=newpath, using=queryset.db)
+        db_alias = queryset.db
+        if emit_signal and update_count > 0:
+            path_updated.send(sender=model, old_path=oldpath, new_path=newpath, using=db_alias)
+        return db_alias
+
+    def _set_newpath_in_branches(self, oldpath, newpath):
+        """
+        .. note::
+
+           The query will only update depth values if needed.
+
+        """
+        self._rewrite_subtree_paths(oldpath, newpath, emit_signal=True)
 
     def get_children(self, node):
         """:returns: A queryset of all the node's children"""
@@ -1128,6 +1822,11 @@ class MP_Node(Node):
     def _get_lastpos_in_path(self):
         """:returns: The integer value of the last step in a path."""
         return self._str2int(self.path[-self.steplen :])
+
+    @classmethod
+    def _bulk_order_field_names(cls):
+        """:returns: node_order_by field names without the descending ``-`` prefix."""
+        return [field[1:] if field.startswith("-") else field for field in cls.node_order_by]
 
     @classmethod
     def _get_parent_path_from_path(cls, path):

@@ -215,6 +215,8 @@ extra steps, materialized path is more efficient than other approaches.
 .. autoclass:: MP_NodeManager
   :show-inheritance:
 
+  .. automethod:: move_bulk
+
   .. automethod:: find_problems
 
    Example:
@@ -239,6 +241,9 @@ extra steps, materialized path is more efficient than other approaches.
 
 .. autoclass:: MP_NodeQuerySet
   :show-inheritance:
+
+.. autoclass:: BulkMoveResult
+   :show-inheritance:
 
 Signals
 -------
