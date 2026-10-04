@@ -240,6 +240,75 @@ extra steps, materialized path is more efficient than other approaches.
 .. autoclass:: MP_NodeQuerySet
   :show-inheritance:
 
+Changing the encoding (``alphabet`` / ``steplen``)
+--------------------------------------------------
+
+The number of siblings each node can hold is bounded by the encoding:
+``len(alphabet) ** steplen - 1``. When a tree approaches that limit (or the
+255-character ``path`` column), the ``alphabet`` and/or ``steplen`` must be
+changed. Because paths are stored materialised in a ``UNIQUE`` column, this
+requires a planned maintenance window rather than a simple class-attribute
+swap.
+
+:mod:`treebeard.recode` performs that migration without touching primary keys
+or business fields. It first decodes the whole tree using the **old**
+encoding (rebuilding structure and sibling order), validates the target
+encoding against per-level capacity, the ``path`` column length and the
+database collation, and then rewrites every path in two collision-free
+phases using an intermediate marker character. A durable mapping/journal
+table makes the process resumable and reversible.
+
+.. warning::
+
+   Do **not** change ``alphabet``/``steplen`` on the model class before the
+   data is migrated. Run the tool while the model still uses the old
+   encoding, deploy the code change only after it succeeds, then clear the
+   migration metadata.
+
+Typical workflow::
+
+   from treebeard.recode import plan_recode, recode_mp_paths
+
+   # 1. read-only pre-flight check (nothing is written)
+   plan = plan_recode(
+       MyNode,
+       old_alphabet=MyNode.alphabet,
+       old_steplen=MyNode.steplen,
+       new_alphabet="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+       new_steplen=4,
+   )
+   plan.raise_if_problems()
+
+   # 2. perform the migration
+   result = recode_mp_paths(
+       MyNode,
+       old_alphabet=MyNode.alphabet,
+       old_steplen=MyNode.steplen,
+       new_alphabet="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+       new_steplen=4,
+   )
+
+   # 3. deploy the new alphabet/steplen on the model class, then:
+   #    forget_recode(MyNode)
+
+Or via the management command::
+
+   python manage.py recode_mp_tree myapp.MyNode --check \
+       --old-alphabet 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ --old-steplen 4 \
+       --new-alphabet 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz \
+       --new-steplen 4
+
+If the process is interrupted, use ``resume_recode`` (or ``--resume``); to
+undo a completed or interrupted migration deterministically use
+``rollback_recode`` (or ``--rollback``). Orphaned or corrupt paths abort the
+migration and are listed in the error; they are never silently attached to
+the root. Stored ``depth``/``numchild`` values are recomputed and cross
+checked, and can be repaired during the write with ``repair_fields=True``
+(``--repair-fields``).
+
+.. automodule:: treebeard.recode
+   :members:
+
 Signals
 -------
 
