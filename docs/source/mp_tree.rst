@@ -210,6 +210,19 @@ extra steps, materialized path is more efficient than other approaches.
   .. automethod:: move
 
      See: :meth:`treebeard.models.Node.move`
+
+  .. automethod:: move_bulk
+
+     Move descriptions are planned and validated against the complete final
+     tree before any row is updated. A description identifies a node by
+     primary key and gives its final parent (``null``/``None`` for a root)
+     and either a zero-based sibling ``index`` or an existing relative
+     position (``left``, ``right``, ``first-sibling``, ``last-sibling`` or
+     the sorted equivalents when ``node_order_by`` is set). All updates run
+     in one transaction, and ``path_updated`` signals are sent only after
+     that transaction commits. Model instances passed in the descriptions are
+     refreshed after a successful commit; after failure or rollback, callers
+     must refresh affected in-memory instances before using them again.
   
 
 .. autoclass:: MP_NodeManager

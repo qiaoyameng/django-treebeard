@@ -342,6 +342,13 @@ class NodeManager(models.Manager):
         """
         raise NotImplementedError
 
+    def move_bulk(self, moves, using=None):  # pragma: no cover
+        """
+        Move several subtrees atomically from their final parent and sibling
+        positions.
+        """
+        raise NotImplementedError
+
     def get_root_nodes(self):  # pragma: no cover
         """:returns: A queryset containing the root nodes in the tree."""
         raise NotImplementedError

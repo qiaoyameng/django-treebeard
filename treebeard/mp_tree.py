@@ -1,5 +1,7 @@
 """Materialized Path Trees"""
 
+from __future__ import annotations
+
 import collections
 import warnings
 from functools import cache
@@ -13,13 +15,16 @@ from django.dispatch import Signal
 from django.utils.translation import gettext_noop as _
 
 from treebeard.deprecation import RemovedInTreebeard8Warning
-from treebeard.exceptions import InvalidMoveToDescendant, PathOverflow
+from treebeard.exceptions import InvalidMoveToDescendant, InvalidPosition, MissingNodeOrderBy, PathOverflow
 from treebeard.models import Node, NodeManager
 from treebeard.numconv import NumConv
 from treebeard.utils import check_create_args, prepare_dumpdata_for_loading, save_m2m
 
 path_updated = Signal()
 nodes_deleted = Signal()
+
+
+_TEMP_PATH_CANDIDATES = "".join(chr(code) for code in range(33, 127) if not chr(code).isalnum())
 
 
 class MP_NodeQuerySet(models.query.QuerySet):
@@ -532,6 +537,590 @@ class MP_NodeManager(NodeManager):
         self.update_parent_counts_after_move(oldpath, newpath)
         node.refresh_from_db()  # Node path and depth will have changed
         target.refresh_from_db()
+
+    def move_bulk(self, moves, using=None):
+        """
+        Move several subtrees as one atomic operation.
+
+        Each item describes the node by primary key and its final parent plus
+        sibling position. An exact zero-based position may be given as
+        ``index``. Relative descriptions use the existing move position names
+        with ``target`` (or ``sibling``) identifying the reference node.
+
+        The complete result is planned and validated before any row is
+        updated. Returned descriptors are therefore independent of the order
+        of ``moves``.
+        """
+        db = using or self._db
+        manager = self.tree_model.objects.db_manager(using=db)
+        db_alias = db or router.db_for_write(self.tree_model)
+        moves = list(moves)
+        tracked_instances = self._bulk_move_tracked_instances(moves)
+
+        with transaction.atomic(using=db):
+            list(manager.select_for_update().order_by().only("pk"))
+            plan = self._prepare_bulk_move_plan(moves, db)
+            changed = self._apply_bulk_move_plan(plan, db)
+
+            def send_signals():
+                for old_path, new_path in changed:
+                    path_updated.send(
+                        sender=self.tree_model, old_path=old_path, new_path=new_path, using=db_alias
+                    )
+
+            transaction.on_commit(send_signals, using=db)
+
+        for instance in tracked_instances:
+            if instance.pk in plan["node_by_pk"]:
+                instance.refresh_from_db(using=db)
+
+        return [
+            {
+                "node_pk": spec["node_pk"],
+                "parent_pk": spec["parent_pk"],
+                "index": plan["final_groups"][spec["parent_pk"]].index(spec["node_pk"]),
+                "old_path": plan["node_by_pk"][spec["node_pk"]].path,
+                "new_path": plan["final_paths"][spec["node_pk"]],
+                "old_depth": plan["node_by_pk"][spec["node_pk"]].depth,
+                "new_depth": plan["final_depths"][spec["node_pk"]],
+            }
+            for spec in plan["specs"]
+        ]
+
+    bulk_move = move_bulk
+
+    def _prepare_bulk_move_plan(self, moves, using):
+        manager = self.tree_model.objects.db_manager(using=using)
+        raw_specs = self._normalize_bulk_move_items(moves)
+
+        referenced_pks = set()
+        for spec in raw_specs:
+            referenced_pks.add(spec["node_pk"])
+            if spec["parent_pk"] is not None:
+                referenced_pks.add(spec["parent_pk"])
+            if spec["target_pk"] is not None:
+                referenced_pks.add(spec["target_pk"])
+
+        node_by_pk = {node.pk: node for node in manager.filter(pk__in=referenced_pks)}
+        missing_pks = referenced_pks.difference(node_by_pk)
+        if missing_pks:
+            raise self.model.DoesNotExist(f"Nodes with primary keys {sorted(missing_pks)} do not exist.")
+
+        specs_by_node = {}
+        specs = []
+        for raw_spec in raw_specs:
+            spec = dict(raw_spec)
+            node_pk = spec["node_pk"]
+            if node_pk in specs_by_node:
+                raise InvalidPosition(f"Node {node_pk} is specified more than once.")
+
+            if spec["pos"] in ("first-child", "last-child", "sorted-child"):
+                if spec["target_pk"] is None:
+                    raise InvalidPosition(f"{spec['pos']} requires a target node.")
+                spec["parent_pk"] = spec["target_pk"]
+                spec["target_pk"] = None
+                if spec["pos"] == "first-child":
+                    spec["pos"] = "first-sibling"
+                elif spec["pos"] == "last-child":
+                    spec["pos"] = "last-sibling"
+
+            if spec["node_pk"] == spec["parent_pk"]:
+                raise InvalidMoveToDescendant(_("Can't move node to itself."))
+
+            specs_by_node[node_pk] = spec
+            specs.append(spec)
+
+        all_nodes = list(manager.only("pk", "path", "depth", "numchild", *self._bulk_move_sort_fields()))
+        all_node_by_pk = {node.pk: node for node in all_nodes}
+        all_node_by_pk.update(node_by_pk)
+        node_by_pk = all_node_by_pk
+
+        path_to_pk = {node.path: node.pk for node in node_by_pk.values()}
+        current_parent = {
+            node.pk: path_to_pk.get(node.path[: -self.model.steplen]) if node.depth > 1 else None
+            for node in node_by_pk.values()
+        }
+        final_parent = dict(current_parent)
+        for spec in specs:
+            final_parent[spec["node_pk"]] = spec["parent_pk"]
+
+        for spec in specs:
+            pos = spec["pos"]
+
+            if isinstance(pos, int) and not isinstance(pos, bool):
+                spec["index"] = spec.pop("pos")
+                spec["mode"] = "exact"
+                if self.model.node_order_by:
+                    raise InvalidPosition("Exact positions cannot be used when node_order_by is enabled.")
+            elif spec["index"] is not None:
+                if pos is not None:
+                    raise InvalidPosition("A bulk move cannot specify both an index and a relative position.")
+                if not isinstance(spec["index"], int) or isinstance(spec["index"], bool) or spec["index"] < 0:
+                    raise InvalidPosition("Bulk move sibling indexes must be non-negative integers.")
+                spec.pop("pos", None)
+                spec["mode"] = "exact"
+                if self.model.node_order_by:
+                    raise InvalidPosition("Exact positions cannot be used when node_order_by is enabled.")
+            elif pos in ("sorted-child", "sorted-sibling"):
+                spec.pop("pos", None)
+                spec["mode"] = "sorted"
+                if not self.model.node_order_by:
+                    raise MissingNodeOrderBy("Missing node_order_by attribute.")
+            else:
+                validated_pos = self._prepare_pos_var_for_move(pos)
+                spec["mode"] = "relative"
+                if validated_pos in ("sorted-child", "sorted-sibling"):
+                    spec["mode"] = "sorted"
+                    spec.pop("pos", None)
+                else:
+                    spec["pos"] = validated_pos
+
+            if spec["mode"] == "relative":
+                target_pk = spec["target_pk"]
+                if target_pk is None:
+                    if spec["pos"] not in ("first-sibling", "last-sibling"):
+                        raise InvalidPosition(f"{spec['pos']} requires a target sibling.")
+                else:
+                    target_parent_pk = final_parent[target_pk]
+                    if spec["parent_pk"] is None:
+                        spec["parent_pk"] = target_parent_pk
+                    elif spec["parent_pk"] != target_parent_pk:
+                        raise InvalidPosition("Target sibling is not in the specified final parent.")
+
+            if spec["mode"] == "exact" and spec["index"] is None:
+                raise InvalidPosition("An exact sibling index is required.")
+
+        self._validate_bulk_move_parent_graph(specs, node_by_pk, final_parent)
+
+        old_groups = collections.defaultdict(list)
+        for node in sorted(node_by_pk.values(), key=lambda item: item.path):
+            old_groups[current_parent[node.pk]].append(node.pk)
+
+        final_groups = {parent_pk: list(child_pks) for parent_pk, child_pks in old_groups.items()}
+        for spec in specs:
+            old_parent_pk = current_parent[spec["node_pk"]]
+            final_groups.setdefault(old_parent_pk, [])
+            final_groups.setdefault(spec["parent_pk"], [])
+            if spec["node_pk"] in final_groups[old_parent_pk]:
+                final_groups[old_parent_pk].remove(spec["node_pk"])
+
+        for parent_pk in {spec["parent_pk"] for spec in specs}:
+            group_specs = [spec for spec in specs if spec["parent_pk"] == parent_pk]
+            modes = {spec["mode"] for spec in group_specs}
+            if len(modes) > 1:
+                raise InvalidPosition("Each final sibling group must use one positioning mode.")
+            mode = modes.pop()
+
+            if mode == "exact":
+                retained = list(final_groups[parent_pk])
+                positions = {}
+                for spec in group_specs:
+                    index = spec["index"]
+                    if not isinstance(index, int) or index < 0:
+                        raise InvalidPosition(f"Invalid sibling index for node {spec['node_pk']}.")
+                    if index in positions:
+                        raise InvalidPosition(f"Duplicate sibling position {index} under parent {parent_pk}.")
+                    positions[index] = spec["node_pk"]
+                ordered_length = len(retained) + len(positions)
+                if positions and max(positions) >= ordered_length:
+                    raise InvalidPosition(f"Sibling position {max(positions)} is out of range.")
+                ordered = [None] * ordered_length
+                for index, node_pk in positions.items():
+                    if index >= len(ordered):
+                        raise InvalidPosition(f"Sibling position {index} is out of range.")
+                    ordered[index] = node_pk
+                retained_iter = iter(retained)
+                for index, value in enumerate(ordered):
+                    if value is None:
+                        try:
+                            ordered[index] = next(retained_iter)
+                        except StopIteration:
+                            raise InvalidPosition(f"Sibling position {index} is out of range.") from None
+                final_groups[parent_pk] = ordered
+            elif mode == "sorted":
+                final_groups[parent_pk].extend(spec["node_pk"] for spec in group_specs)
+                ordered_nodes = manager.filter(pk__in=final_groups[parent_pk]).order_by(
+                    *self.model.node_order_by, "path"
+                )
+                final_groups[parent_pk] = [node.pk for node in ordered_nodes]
+            else:
+                final_groups[parent_pk] = self._resolve_relative_bulk_move_group(
+                    parent_pk, group_specs, final_groups[parent_pk], final_parent, node_by_pk
+                )
+
+        affected_parent_pks = {current_parent[spec["node_pk"]] for spec in specs}
+        affected_parent_pks.update(spec["parent_pk"] for spec in specs)
+
+        final_depths = {}
+        final_paths = {}
+
+        def resolve_final_depth(node_pk):
+            if node_pk in final_depths:
+                return final_depths[node_pk]
+            chain = []
+            seen = set()
+            current = node_pk
+            while current is not None and current not in final_depths:
+                if current in seen:
+                    raise InvalidMoveToDescendant(_("Can't move node to a descendant."))
+                seen.add(current)
+                chain.append(current)
+                current = final_parent[current]
+            depth = 0 if current is None else final_depths[current]
+            for chain_pk in reversed(chain):
+                depth += 1
+                final_depths[chain_pk] = depth
+            return final_depths[node_pk]
+
+        for parent_pk in affected_parent_pks:
+            if parent_pk is not None:
+                resolve_final_depth(parent_pk)
+
+        for parent_pk in sorted(affected_parent_pks, key=lambda pk: 0 if pk is None else final_depths[pk]):
+            parent_depth = 0 if parent_pk is None else final_depths[parent_pk]
+            parent_path = "" if parent_pk is None else self._final_path_for_bulk_move_parent(
+                parent_pk, final_parent, node_by_pk, final_paths
+            )
+            child_pks = final_groups[parent_pk]
+            capacity = len(self.model.alphabet) ** self.model.steplen - 1
+            if len(child_pks) > capacity:
+                raise PathOverflow(_("No more path positions are available in this sibling group."))
+            for index, child_pk in enumerate(child_pks, start=1):
+                final_paths[child_pk] = self.model._get_path(parent_path, parent_depth + 1, index)
+                final_depths[child_pk] = parent_depth + 1
+
+        return {
+            "specs": specs,
+            "node_by_pk": node_by_pk,
+            "current_parent": current_parent,
+            "final_parent": final_parent,
+            "old_groups": dict(old_groups),
+            "final_groups": dict(final_groups),
+            "affected_parent_pks": affected_parent_pks,
+            "final_depths": final_depths,
+            "final_paths": final_paths,
+        }
+
+    def _normalize_bulk_move_items(self, moves):
+        specs = []
+        for item in moves:
+            if isinstance(item, (tuple, list)):
+                if len(item) != 3:
+                    raise InvalidPosition("Each bulk move must contain node, parent and position.")
+                node_value, parent_value, position = item
+                item = {"node": node_value, "parent": parent_value, "position": position}
+            if not isinstance(item, dict):
+                raise InvalidPosition("Bulk move descriptions must be dictionaries.")
+
+            node_pk = self._bulk_move_pk(item.get("node_pk", item.get("node", item.get("id"))))
+            if node_pk is None:
+                raise InvalidPosition("Each bulk move must identify a node.")
+
+            parent_pk = item.get("parent_pk", item.get("parent"))
+            target_pk = item.get("target_pk", item.get("target", item.get("sibling", item.get("ref"))))
+
+            spec = {
+                "node_pk": node_pk,
+                "parent_pk": None if parent_pk is None else self._bulk_move_pk(parent_pk),
+                "target_pk": None if target_pk is None else self._bulk_move_pk(target_pk),
+                "index": item.get("index"),
+                "pos": item.get("pos", item.get("position")),
+            }
+            specs.append(spec)
+        return specs
+
+    @staticmethod
+    def _bulk_move_pk(value):
+        if value is None or isinstance(value, (int, str)):
+            return value
+        if hasattr(value, "pk"):
+            return value.pk
+        return value
+
+    def _bulk_move_tracked_instances(self, moves):
+        tracked = {}
+        for item in moves:
+            if not isinstance(item, dict):
+                continue
+            for value in item.values():
+                if isinstance(value, models.Model) and value.pk is not None:
+                    tracked[id(value)] = value
+        return list(tracked.values())
+
+    def _bulk_move_sort_fields(self):
+        return [field[1:] if field.startswith("-") else field for field in self.model.node_order_by]
+
+    def _validate_bulk_move_parent_graph(self, specs, node_by_pk, final_parent):
+        visiting = set()
+        visited = set()
+
+        def visit(node_pk):
+            if node_pk in visited:
+                return
+            if node_pk in visiting:
+                raise InvalidMoveToDescendant(_("Can't move node to a descendant."))
+            visiting.add(node_pk)
+            parent_pk = final_parent[node_pk]
+            if parent_pk is not None:
+                if parent_pk not in node_by_pk:
+                    raise InvalidPosition(f"Parent node {parent_pk} does not exist.")
+                visit(parent_pk)
+            visiting.remove(node_pk)
+            visited.add(node_pk)
+
+        for node_pk in {spec["node_pk"] for spec in specs}:
+            visit(node_pk)
+
+    def _resolve_relative_bulk_move_group(
+        self, parent_pk, group_specs, retained_pks, final_parent, node_by_pk
+    ):
+        child_pks = list(retained_pks)
+        child_pks.extend(spec["node_pk"] for spec in group_specs)
+        edges = {child_pk: set() for child_pk in child_pks}
+        incoming = {child_pk: set() for child_pk in child_pks}
+        immediate = []
+
+        def add_edge(from_pk, to_pk):
+            if from_pk == to_pk:
+                return
+            if to_pk not in edges[from_pk]:
+                edges[from_pk].add(to_pk)
+                incoming[to_pk].add(from_pk)
+
+        retained_order = list(retained_pks)
+        for index, earlier_pk in enumerate(retained_order):
+            for later_pk in retained_order[index + 1 :]:
+                add_edge(earlier_pk, later_pk)
+
+        first_specs = [spec for spec in group_specs if spec["pos"] == "first-sibling" and spec["target_pk"] is None]
+        last_specs = [spec for spec in group_specs if spec["pos"] == "last-sibling" and spec["target_pk"] is None]
+        if len(first_specs) > 1 or len(last_specs) > 1:
+            raise InvalidPosition(f"Duplicate sibling position under parent {parent_pk}.")
+
+        side_positions = {}
+        for spec in group_specs:
+            node_pk = spec["node_pk"]
+            pos = spec["pos"]
+            target_pk = spec["target_pk"]
+
+            if pos == "first-sibling" and target_pk is None:
+                immediate.append((node_pk, None))
+                for other_pk in child_pks:
+                    if other_pk != node_pk:
+                        add_edge(node_pk, other_pk)
+            elif pos == "last-sibling" and target_pk is None:
+                immediate.append((None, node_pk))
+                for other_pk in child_pks:
+                    if other_pk != node_pk:
+                        add_edge(other_pk, node_pk)
+            elif pos in ("left", "right"):
+                if target_pk is None:
+                    raise InvalidPosition(f"{pos} requires a target sibling.")
+                if final_parent.get(target_pk) != parent_pk:
+                    raise InvalidPosition("Target sibling is not in the specified final parent.")
+                key = (pos, target_pk)
+                if key in side_positions:
+                    raise InvalidPosition(f"Duplicate sibling position next to node {target_pk}.")
+                side_positions[key] = node_pk
+                immediate.append((node_pk, target_pk) if pos == "left" else (target_pk, node_pk))
+                if pos == "left":
+                    add_edge(node_pk, target_pk)
+                else:
+                    add_edge(target_pk, node_pk)
+            else:
+                raise InvalidPosition(f"Invalid relative position: {pos}")
+
+        old_order = {
+            node_pk: index
+            for index, node_pk in enumerate(sorted(child_pks, key=lambda pk: node_by_pk[pk].path))
+        }
+        ready = sorted([pk for pk, parents in incoming.items() if not parents], key=lambda pk: old_order[pk])
+        ordered = []
+        while ready:
+            if len(ready) > 1:
+                raise InvalidPosition("Bulk move positions do not uniquely determine sibling order.")
+            node_pk = ready.pop(0)
+            ordered.append(node_pk)
+            for child_pk in sorted(edges[node_pk], key=lambda pk: old_order[pk]):
+                incoming[child_pk].remove(node_pk)
+                if not incoming[child_pk]:
+                    ready.append(child_pk)
+            ready.sort(key=lambda pk: old_order[pk])
+
+        if len(ordered) != len(child_pks):
+            raise InvalidPosition("Bulk move positions contain a cyclic sibling ordering.")
+
+        positions = {node_pk: index for index, node_pk in enumerate(ordered)}
+        if first_specs and positions[first_specs[0]["node_pk"]] != 0:
+            raise InvalidPosition("Conflicting first-sibling bulk move positions.")
+        if last_specs and positions[last_specs[0]["node_pk"]] != len(ordered) - 1:
+            raise InvalidPosition("Conflicting last-sibling bulk move positions.")
+        for before_pk, after_pk in immediate:
+            if before_pk is not None and after_pk is not None and positions[before_pk] + 1 != positions[after_pk]:
+                raise InvalidPosition("Conflicting adjacent bulk move positions.")
+
+        return ordered
+
+    def _final_path_for_bulk_move_parent(
+        self, parent_pk, final_parent, node_by_pk, final_paths
+    ):
+        if parent_pk in final_paths:
+            return final_paths[parent_pk]
+
+        chain = []
+        current_pk = parent_pk
+        while current_pk is not None and current_pk not in final_paths:
+            chain.append(current_pk)
+            current_pk = final_parent[current_pk]
+
+        if current_pk is None:
+            return node_by_pk[parent_pk].path
+
+        changed_pk = current_pk
+        old_changed_path = node_by_pk[changed_pk].path
+        new_changed_path = final_paths[changed_pk]
+        old_path = node_by_pk[parent_pk].path
+        return new_changed_path + old_path[len(old_changed_path) :]
+
+    def _apply_bulk_move_plan(self, plan, using):
+        model = self.tree_model
+        manager = model.objects.db_manager(using=using)
+        node_by_pk = plan["node_by_pk"]
+        final_paths = plan["final_paths"]
+        final_depths = plan["final_depths"]
+
+        candidates = []
+        for node_pk, node in node_by_pk.items():
+            new_path = final_paths.get(node_pk)
+            new_depth = final_depths.get(node_pk)
+            if new_path is not None and (new_path != node.path or new_depth != node.depth):
+                candidates.append(node_pk)
+                continue
+            matching_moved_specs = [
+                spec
+                for spec in plan["specs"]
+                if spec["node_pk"] != node_pk and node.path.startswith(node_by_pk[spec["node_pk"]].path)
+            ]
+            matching_moved_specs.sort(key=lambda spec: len(node_by_pk[spec["node_pk"]].path), reverse=True)
+            for moved_spec in matching_moved_specs:
+                moved_pk = moved_spec["node_pk"]
+                old_prefix = node_by_pk[moved_pk].path
+                new_prefix = final_paths[moved_pk]
+                derived_path = new_prefix + node.path[len(old_prefix) :]
+                if derived_path != node.path:
+                    final_paths[node_pk] = derived_path
+                    final_depths[node_pk] = len(derived_path) // model.steplen
+                    candidates.append(node_pk)
+                break
+
+        candidate_paths = {node_by_pk[node_pk].path: node_pk for node_pk in candidates}
+
+        max_suffix_length = {}
+        for node_pk in candidates:
+            old_path = node_by_pk[node_pk].path
+            nested_paths = [
+                candidate_path
+                for candidate_path in candidate_paths
+                if candidate_path != old_path and candidate_path.startswith(old_path)
+            ]
+            lengths = [0]
+            for node in node_by_pk.values():
+                if not node.path.startswith(old_path):
+                    continue
+                if any(node.path.startswith(nested_path) and node.path != nested_path for nested_path in nested_paths):
+                    continue
+                lengths.append(len(node.path) - len(old_path))
+            max_suffix_length[node_pk] = max(lengths)
+
+        path_max_length = model._meta.get_field("path").max_length
+        for node_pk in candidates:
+            new_path = final_paths[node_pk]
+            if len(new_path) + max_suffix_length[node_pk] > path_max_length:
+                raise PathOverflow(
+                    _(
+                        "The new node is too deep in the tree, try"
+                        " increasing the path.max_length property"
+                        " and UPDATE your database"
+                    )
+                )
+
+        used_path_chars = set()
+        for path in manager.values_list("path", flat=True):
+            used_path_chars.update(path)
+        temp_alphabet = "".join(
+            char
+            for char in _TEMP_PATH_CANDIDATES + "¡¢£¤¥¦§¨©«¬®¯°±²³´µ¶·¸¹º»¿"
+            if char not in model.alphabet and char not in used_path_chars
+        )
+        if not temp_alphabet:
+            raise PathOverflow(_("No temporary path characters are available."))
+
+        def temp_path(index, old_path):
+            converter = NumConv(temp_alphabet)
+            try:
+                encoded = converter.int2str(index) if index else ""
+            except ValueError as exc:
+                raise PathOverflow(_("Path Overflow")) from exc
+            if not encoded:
+                return temp_alphabet[0] * model.steplen + old_path[model.steplen :]
+            encoded_steps = [encoded[i : i + model.steplen] for i in range(0, len(encoded), model.steplen)]
+            extra_steps = len(encoded_steps) - 1
+            if len(old_path) + extra_steps * model.steplen > path_max_length:
+                raise PathOverflow(_("Path Overflow"))
+            first_encoded_step = encoded_steps[0].rjust(model.steplen, temp_alphabet[0])
+            prefix = first_encoded_step + "".join(
+                step.ljust(model.steplen, temp_alphabet[0]) for step in encoded_steps[1:]
+            )
+            return prefix + old_path[model.steplen :]
+
+        temp_paths = {}
+        ordered_candidates = sorted(
+            candidates, key=lambda pk: (len(node_by_pk[pk].path), node_by_pk[pk].path)
+        )
+        for index, node_pk in enumerate(ordered_candidates):
+            old_path = node_by_pk[node_pk].path
+            temp_paths[node_pk] = temp_path(index, old_path)
+
+        for node_pk in sorted(candidates, key=lambda pk: len(node_by_pk[pk].path), reverse=True):
+            old_path = node_by_pk[node_pk].path
+            temp = temp_paths[node_pk]
+            queryset = manager.filter(path__startswith=old_path)
+            nested_paths = [
+                node_by_pk[nested_pk].path
+                for nested_pk in candidates
+                if nested_pk != node_pk and node_by_pk[nested_pk].path.startswith(old_path)
+            ]
+            for nested_path in nested_paths:
+                queryset = queryset.exclude(path__startswith=nested_path)
+            update_count = queryset.update(path=Concat(Value(temp), Substr("path", len(old_path) + 1)))
+            if update_count == 0:
+                raise PathOverflow(_("Path Overflow"))
+
+        for node_pk in sorted(
+            candidates,
+            key=lambda pk: (len(final_paths[pk]), final_paths[pk]),
+        ):
+            old_path = temp_paths[node_pk]
+            new_path = final_paths[node_pk]
+            new_path_value = Concat(Value(new_path), Substr("path", len(old_path) + 1))
+            manager.filter(path__startswith=old_path).update(
+                depth=Length(new_path_value) / model.steplen,
+                path=new_path_value,
+            )
+
+        for pk in node_by_pk:
+            expected_count = len(plan["final_groups"].get(pk, []))
+            if node_by_pk[pk].numchild != expected_count:
+                manager.filter(pk=pk).update(numchild=expected_count)
+
+        return [
+            (node_by_pk[node_pk].path, final_paths[node_pk])
+            for node_pk in sorted(
+                candidates,
+                key=lambda pk: (len(node_by_pk[pk].path), node_by_pk[pk].path),
+                reverse=True,
+            )
+        ]
 
     def update_parent_counts_after_move(self, oldpath, newpath):
         """

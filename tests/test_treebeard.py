@@ -16,6 +16,7 @@ from django.contrib.messages.storage.fallback import FallbackStorage
 from django.core import checks
 from django.core.checks.model_checks import check_all_models
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.db.models import Manager
 from django.db.models.signals import post_save
 from django.dispatch import receiver
@@ -3805,6 +3806,235 @@ class TestMP_TreeStepOverflow(TestTreeBase):
             for pos in positions:
                 with pytest.raises(PathOverflow):
                     mpsmallstep_model.objects.move(newroot, target, pos)
+
+
+@pytest.mark.django_db(transaction=True)
+class TestMP_BulkMove(TestTreeBase):
+    def test_exchange_subtrees_by_final_position(self, django_capture_on_commit_callbacks):
+        model = models.MP_TestNodeSmallStep
+        a = model.objects.add_root({})
+        ac = model.objects.add_child(a, {})
+        b = model.objects.add_root({})
+
+        result = model.objects.move_bulk(
+            [
+                {"node": a.pk, "parent": None, "index": 1},
+                {"node": b.pk, "parent": None, "index": 0},
+            ]
+        )
+
+        a.refresh_from_db()
+        b.refresh_from_db()
+        ac.refresh_from_db()
+        assert (a.path, a.depth) == ("2", 1)
+        assert (ac.path, ac.depth) == ("21", 2)
+        assert (b.path, b.depth) == ("1", 1)
+        assert [(item["node_pk"], item["new_path"], item["index"]) for item in result] == [
+            (a.pk, "2", 1),
+            (b.pk, "1", 0),
+        ]
+        assert not any(model.objects.find_problems())
+
+    def test_relative_target_parent_is_also_moved(self):
+        model = models.MP_TestNodeSmallStep
+        root = model.objects.add_root({})
+        child = model.objects.add_child(root, {})
+        other_child = model.objects.add_child(root, {})
+        target = model.objects.add_root({})
+
+        model.objects.move_bulk(
+            [
+                {"node": root.pk, "parent": None, "index": 0},
+                {"node": target.pk, "parent": root.pk, "pos": "left", "target": child.pk},
+                {"node": other_child.pk, "parent": None, "index": 1},
+            ]
+        )
+
+        assert list(model.objects.order_by("path").values_list("path", "depth", "numchild")) == [
+            ("1", 1, 2),
+            ("11", 2, 0),
+            ("12", 2, 0),
+            ("2", 1, 0),
+        ]
+        assert not any(model.objects.find_problems())
+
+    def test_nested_ancestor_and_descendant_move_in_one_batch(self):
+        model = models.MP_TestNode
+        root = model.objects.add_root({"desc": "root"})
+        branch = model.objects.add_child(root, {"desc": "branch"})
+        nested = model.objects.add_child(branch, {"desc": "nested"})
+        other_root = model.objects.add_root({"desc": "other-root"})
+        destination_root = model.objects.add_root({"desc": "destination-root"})
+
+        model.objects.move_bulk(
+            [
+                {"node": branch.pk, "parent": destination_root.pk, "index": 0},
+                {"node": nested.pk, "parent": other_root.pk, "index": 0},
+                {"node": other_root.pk, "parent": None, "index": 0},
+                {"node": destination_root.pk, "parent": None, "index": 1},
+                {"node": root.pk, "parent": None, "index": 2},
+            ]
+        )
+
+        assert list(model.objects.order_by("path").values_list("path", "depth", "numchild")) == [
+            ("001", 1, 1),
+            ("001001", 2, 0),
+            ("002", 1, 1),
+            ("002001", 2, 0),
+            ("003", 1, 0),
+        ]
+        assert not any(model.objects.find_problems())
+
+    def test_duplicate_final_position_rejected_before_writes(self):
+        model = models.MP_TestNodeSmallStep
+        a = model.objects.add_root({})
+        b = model.objects.add_root({})
+        before = list(model.objects.values_list("pk", "path"))
+
+        with pytest.raises(InvalidPosition):
+            model.objects.move_bulk(
+                [
+                    {"node": a.pk, "parent": None, "index": 0},
+                    {"node": b.pk, "parent": None, "index": 0},
+                ]
+            )
+
+        assert list(model.objects.values_list("pk", "path")) == before
+
+    def test_descendant_cycle_rejected(self):
+        model = models.MP_TestNodeSmallStep
+        parent = model.objects.add_root({})
+        child = model.objects.add_child(parent, {})
+
+        with pytest.raises(InvalidMoveToDescendant):
+            model.objects.move_bulk([{"node": parent.pk, "parent": child.pk, "index": 0}])
+
+    def test_path_capacity_checked_from_final_tree(self):
+        model = models.MP_TestNodeSmallStep
+        parent = model.objects.add_root({})
+        child = model.objects.add_child(parent, {})
+        full_parent = model.objects.add_root({})
+        for index in range(3, 10):
+            model.objects.add_root({})
+        for index in range(8):
+            model.objects.add_child(full_parent, {})
+        model(path=f"{full_parent.path}9", depth=2, numchild=0).save()
+        full_parent.numchild = 9
+        full_parent.save(update_fields=["numchild"])
+        full_parent.refresh_from_db()
+
+        with pytest.raises(PathOverflow):
+            model.objects.move_bulk([{"node": child.pk, "parent": full_parent.pk, "index": 0}])
+
+    def test_path_depth_capacity_checked_from_final_tree(self):
+        model = models.MP_TestNodeShortPath
+        parent = model.objects.add_root({"desc": "parent"})
+        child = model.objects.add_child(parent, {"desc": "child"})
+        grandchild = model.objects.add_child(child, {"desc": "grandchild"})
+        grandparent = model.objects.add_root({"desc": "grandparent"})
+        great_grandparent = model.objects.add_child(grandparent, {"desc": "great"})
+        great_grandparent.refresh_from_db()
+
+        with pytest.raises(PathOverflow):
+            model.objects.move_bulk([{"node": parent.pk, "parent": great_grandparent.pk, "index": 0}])
+
+    def test_sorted_constraints(self):
+        model = models.MP_TestNodeSorted
+        a = model.objects.add_root({"val1": 2, "val2": 1, "desc": "b"})
+        b = model.objects.add_root({"val1": 1, "val2": 1, "desc": "a"})
+
+        with pytest.raises(InvalidPosition):
+            model.objects.move_bulk([{"node": a.pk, "parent": None, "index": 0}])
+
+        model.objects.move_bulk([{"node": a.pk, "parent": None, "pos": "sorted-sibling"}])
+        assert list(model.objects.order_by("path").values_list("desc", flat=True)) == ["a", "b"]
+
+    def test_cached_parent_refreshed_after_commit(self):
+        model = models.MP_TestNodeSmallStep
+        a = model.objects.add_root({})
+        b = model.objects.add_child(a, {})
+        c = model.objects.add_root({})
+        cached_parent = model.objects.get_parent(b)
+        assert cached_parent.pk == a.pk
+
+        model.objects.move_bulk(
+            [
+                {"node": a.pk, "parent": c.pk, "index": 0},
+                {"node": c.pk, "parent": None, "index": 0},
+            ]
+        )
+
+        b.refresh_from_db()
+        cached_parent.refresh_from_db()
+        assert b.path == "111"
+        assert model.objects.get_parent(b, update=True).pk == a.pk
+        assert model.objects.get_parent(a, update=True).pk == c.pk
+
+    def test_signal_only_sent_after_commit(self, django_capture_on_commit_callbacks):
+        model = models.MP_TestNodeSmallStep
+        a = model.objects.add_root({})
+        child = model.objects.add_child(a, {})
+        b = model.objects.add_root({})
+        received = []
+
+        def handler(sender, **kwargs):
+            received.append((kwargs["old_path"], kwargs["new_path"], kwargs["using"]))
+
+        path_updated.connect(handler)
+        try:
+            with transaction.atomic():
+                with django_capture_on_commit_callbacks(execute=True) as callbacks:
+                    model.objects.move_bulk(
+                        [
+                            {"node": a.pk, "parent": None, "index": 1},
+                            {"node": b.pk, "parent": None, "index": 0},
+                        ]
+                    )
+                    assert not received
+        finally:
+            path_updated.disconnect(handler)
+
+        assert len(callbacks) == 1
+        assert sorted(set(received)) == [
+            ("1", "2", "default"),
+            ("11", "21", "default"),
+            ("2", "1", "default"),
+        ]
+        child.refresh_from_db()
+        assert child.path == "21"
+
+    def test_mid_write_exception_rolls_back_entire_batch(self, monkeypatch, django_capture_on_commit_callbacks):
+        model = models.MP_TestNodeSmallStep
+        a = model.objects.add_root({})
+        child = model.objects.add_child(a, {})
+        model.objects.add_child(child, {})
+        b = model.objects.add_root({})
+        before = list(model.objects.order_by("path").values_list("path", "depth", "numchild"))
+
+        original_filter = type(model.objects.all()).filter
+        calls = 0
+
+        def failing_filter(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 7:
+                raise RuntimeError("boom")
+            return original_filter(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(model.objects.all()), "filter", failing_filter)
+        with django_capture_on_commit_callbacks(execute=True) as callbacks:
+            with pytest.raises(RuntimeError, match="boom"):
+                model.objects.move_bulk(
+                    [
+                        {"node": a.pk, "parent": None, "index": 1},
+                        {"node": b.pk, "parent": None, "index": 0},
+                    ]
+                )
+        monkeypatch.undo()
+
+        assert list(model.objects.order_by("path").values_list("path", "depth", "numchild")) == before
+        assert callbacks == []
+        assert not any(model.objects.find_problems())
 
 
 @pytest.mark.django_db
