@@ -749,6 +749,24 @@ class MP_NodeManager(NodeManager):
             lnk[path] = newobj
         return ret
 
+    def sync(self, manifest, parent=None, **kwargs):
+        """
+        Synchronizes the subtree rooted at ``parent`` (or the whole forest)
+        with an external manifest, using add/move/update/delete operations
+        instead of deleting and reloading the subtree. Nodes are matched by
+        a stable external identity field, so primary keys are preserved.
+
+        This is a shortcut for :func:`treebeard.sync.sync_tree`; see its
+        documentation for the manifest format and all supported options
+        (``identity_field``, ``on_missing``, ``protect``, ``dry_run``,
+        ``expected_summary``).
+
+        :returns: A :class:`treebeard.sync.SyncPlan` describing the changes.
+        """
+        from treebeard.sync import sync_tree
+
+        return sync_tree(self.model, manifest, parent=parent, **kwargs)
+
     def _increment_numchild(self, path):
         self.tree_model.objects.filter(path=path).update(numchild=F("numchild") + 1)
 

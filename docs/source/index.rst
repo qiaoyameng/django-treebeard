@@ -42,6 +42,7 @@ Reference
 
    api
    mp_tree
+   sync
    ns_tree
    al_tree
    ltree

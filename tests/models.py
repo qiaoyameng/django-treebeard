@@ -157,6 +157,26 @@ class MP_TestNodeUuid(MP_Node, DescMixin):
     custom_id = models.UUIDField(primary_key=True, default=uuid.uuid1, editable=False)
 
 
+class MP_TestNodeExternal(MP_Node, DescMixin):
+    steplen = 3
+    external_id = models.CharField(max_length=64, unique=True)
+
+
+class MP_TestNodeExternalSorted(MP_Node, DescMixin):
+    steplen = 3
+    node_order_by = ["desc"]
+    external_id = models.CharField(max_length=64, unique=True)
+
+
+class MP_TestNodeExternalShortPath(MP_Node, DescMixin):
+    steplen = 1
+    alphabet = "012345678"
+    external_id = models.CharField(max_length=64, unique=True)
+
+
+MP_TestNodeExternalShortPath._meta.get_field("path").max_length = 4
+
+
 # This is how you change the default fields defined in a Django abstract class
 # (in this case, MP_Node), since Django doesn't allow overriding fields, only
 # mehods and attributes

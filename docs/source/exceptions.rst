@@ -12,3 +12,17 @@ Exceptions
 .. autoexception:: PathOverflow
 
 .. autoexception:: MissingNodeOrderBy
+
+.. autoexception:: SyncError
+
+.. autoexception:: DuplicateIdentity
+
+.. autoexception:: ManifestCycle
+
+.. autoexception:: InvalidManifestOrder
+
+.. autoexception:: IdentityConflict
+
+.. autoexception:: ProtectedNode
+
+.. autoexception:: StaleSyncSummary

@@ -1,3 +1,16 @@
+Unreleased
+----------
+
+- Added ``treebeard.sync.sync_tree`` (also available as
+  ``MP_NodeManager.sync()``), a sync entry point that reconciles an
+  ``MP_Node`` subtree with an external manifest keyed by a stable identity
+  field. It plans and applies field updates, moves, additions and optional
+  deletions using the existing add/move/delete primitives - preserving
+  primary keys - instead of deleting and reloading the subtree. Supports
+  dry-run plans with a structure summary that is validated on apply, which
+  runs in a single transaction.
+
+
 Release 7.0.2 (Sep 15, 2026)
 ----------------------------
 
