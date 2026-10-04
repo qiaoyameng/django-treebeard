@@ -237,6 +237,92 @@ extra steps, materialized path is more efficient than other approaches.
 
   .. automethod:: load_bulk
 
+  .. automethod:: sync_tree
+
+  .. automethod:: plan_sync_tree
+
+  .. automethod:: apply_sync_tree
+
+Synchronizing an external tree
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``sync_tree()`` to reconcile a subtree with an upstream directory tree
+without deleting the whole subtree and calling ``load_bulk()``. Nodes are
+matched by a stable external identity field (``external_id`` by default), and
+existing rows are updated, moved, or left untouched according to the manifest.
+
+The manifest is the same nested ``data`` / ``children`` structure used by
+``load_bulk()``, with the external identity included in ``data`` or supplied
+as ``external_id``:
+
+.. code-block:: python
+
+   manifest = [
+       {
+           "data": {"external_id": "root", "name": "Root"},
+           "children": [
+               {
+                   "data": {"external_id": "folder", "name": "Renamed folder"},
+                   "children": [
+                       {"data": {"external_id": "file", "name": "File"}, "children": []}
+                   ],
+               }
+           ],
+       }
+   ]
+
+Pass ``root`` to synchronize only that subtree. The root itself may have its
+fields updated, but it cannot be moved or deleted. With no root, the manifest
+represents the complete root forest. Existing external ids outside the chosen
+scope raise ``CrossScopeIdentityConflict`` and no data is written.
+
+Use a dry run to inspect the plan and the old-tree summary:
+
+.. code-block:: python
+
+   plan = MyNode.objects.plan_sync_tree(manifest, root=root)
+   print(plan.changes)
+   print(plan.old_structure)
+
+The returned plan separates ``create``, ``update``, ``move`` and ``delete``
+changes. Applying recomputes the old-tree snapshot, verifies its checksum in
+the same database transaction, then performs all writes atomically. A stale
+plan raises ``SyncSummaryMismatch``:
+
+.. code-block:: python
+
+   MyNode.objects.apply_sync_tree(plan)
+
+Missing nodes are retained by default. Set ``on_missing="delete"`` to remove
+old subtrees after any descendants that remain in the manifest have been moved
+to their new parents. You can supply a ``can_delete`` callable that receives a
+queryset of minimal missing subtrees selected for deletion; returning
+``False`` or raising an exception aborts the operation.
+
+Invalid manifests are rejected before writing. This includes duplicate
+external ids, a move beneath one of the node's own old descendants, child
+ordering that contradicts ``node_order_by``, and trees that would exceed the
+configured path depth or sibling capacity.
+
+This example renames a node first and then moves it. Its primary key is
+preserved; only the materialized paths of it and its descendants are rewritten:
+
+.. code-block:: python
+
+   primary_key = MyNode.objects.get(external_id="folder").pk
+   plan = MyNode.objects.plan_sync_tree(new_manifest, root=root)
+   MyNode.objects.apply_sync_tree(plan)
+   assert MyNode.objects.get(pk=primary_key).external_id == "folder"
+
+Saving field updates emits Django's normal ``post_save`` signal. Moving a
+branch or compacting existing path holes before insertion uses bulk path
+updates and emits ``path_updated``; deletion emits ``nodes_deleted`` together
+with Django's normal delete signals. Python
+instances loaded before the move retain stale ``path``, ``depth`` and cached
+parent values; fetch them again or call ``refresh_from_db()`` before using
+tree methods. Repeating the same plan after a successful import reports no
+changes.
+
 .. autoclass:: MP_NodeQuerySet
   :show-inheritance:
 

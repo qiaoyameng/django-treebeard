@@ -16,6 +16,7 @@ from treebeard.deprecation import RemovedInTreebeard8Warning
 from treebeard.exceptions import InvalidMoveToDescendant, PathOverflow
 from treebeard.models import Node, NodeManager
 from treebeard.numconv import NumConv
+from treebeard.sync_tree import apply_mp_sync, plan_mp_sync
 from treebeard.utils import check_create_args, prepare_dumpdata_for_loading, save_m2m
 
 path_updated = Signal()
@@ -91,6 +92,41 @@ class MP_NodeQuerySet(models.query.QuerySet):
 
 class MP_NodeManager(NodeManager):
     """Custom manager for nodes in a Materialized Path tree."""
+
+    def sync_tree(
+        self,
+        manifest,
+        *,
+        root=None,
+        external_id_field="external_id",
+        on_missing="retain",
+        can_delete=None,
+        dry_run=False,
+        using=None,
+    ):
+        """Plan or apply synchronization of a subtree from external ids."""
+        db = using or self._db
+        plan = plan_mp_sync(
+            self.tree_model,
+            manifest,
+            using=db,
+            root=root,
+            external_id_field=external_id_field,
+            on_missing=on_missing,
+            can_delete=can_delete,
+        )
+        if dry_run:
+            return plan
+        return apply_mp_sync(plan, using=db)
+
+    def plan_sync_tree(self, manifest, **kwargs):
+        """Return the synchronization plan without writing to the database."""
+        kwargs["dry_run"] = True
+        return self.sync_tree(manifest, **kwargs)
+
+    def apply_sync_tree(self, plan, *, using=None):
+        """Apply a previously planned synchronization after validating its summary."""
+        return apply_mp_sync(plan, using=using or self._db)
 
     def get_queryset(self):
         """Sets the custom queryset as the default."""

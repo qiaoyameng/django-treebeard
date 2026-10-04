@@ -42,6 +42,34 @@ class MP_TestNode(MP_Node, DescMixin):
     steplen = 3
 
 
+class MP_TestNodeExternal(MP_Node):
+    steplen = 3
+    external_id = models.CharField(max_length=64, unique=True)
+    desc = models.CharField(max_length=255, blank=True)
+
+
+class MP_TestNodeExternalSorted(MP_Node):
+    steplen = 3
+    node_order_by = ["seq"]
+    external_id = models.CharField(max_length=64, unique=True)
+    seq = models.IntegerField()
+
+
+class MP_TestNodeExternalShortPath(MP_Node):
+    steplen = 1
+    alphabet = "012345678"
+    external_id = models.CharField(max_length=64, unique=True)
+
+
+MP_TestNodeExternalShortPath._meta.get_field("path").max_length = 4
+
+
+class MP_TestNodeExternalCode(MP_Node):
+    steplen = 3
+    external_code = models.CharField(max_length=64, unique=True)
+    desc = models.CharField(max_length=255, blank=True)
+
+
 class MP_TestNodeSomeDep(models.Model):
     node = models.ForeignKey(MP_TestNode, on_delete=models.CASCADE)
 

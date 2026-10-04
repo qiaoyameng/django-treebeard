@@ -1,3 +1,10 @@
+Unreleased
+----------
+
+- Added `MP_NodeManager.sync_tree()` for reconciling a materialized-path subtree with an external
+  manifest by stable external ids, with dry-run planning, summary validation, atomic apply, field
+  update/create/move/delete plans, subtree scope checks, and deletion protection callbacks.
+
 Release 7.0.2 (Sep 15, 2026)
 ----------------------------
 
