@@ -240,6 +240,63 @@ extra steps, materialized path is more efficient than other approaches.
 .. autoclass:: MP_NodeQuerySet
   :show-inheritance:
 
+Changing the path encoding (alphabet/steplen)
+---------------------------------------------
+
+When the sibling capacity of the current
+:attr:`~MP_Node.steplen`/:attr:`~MP_Node.alphabet` combination is about to
+run out, the ``path`` column must be rewritten under new encoding
+parameters. The :mod:`treebeard.mp_recode` module provides a
+maintenance-window migration tool for this. It takes the old and the new
+parameters explicitly, so the data can be migrated *before* the model class
+is switched to the new configuration:
+
+.. code-block:: python
+
+   from treebeard.mp_recode import recode_tree, check_encoding
+
+   # during a maintenance window, while MyNodeModel still uses the OLD
+   # alphabet/steplen:
+   recode_tree(
+       MyNodeModel,
+       old_alphabet="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+       old_steplen=4,
+       new_alphabet="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+       new_steplen=6,
+   )
+   # only now update MyNodeModel.alphabet / MyNodeModel.steplen and deploy
+
+The tool:
+
+* restores the tree structure and the sibling order by decoding every
+  stored path with the **old** parameters,
+* validates the new alphabet (including database collation compatibility),
+  the per-level sibling capacity and ``path.max_length`` before writing,
+* aborts with a list of offending primary keys when it finds corrupt rows
+  or orphan nodes (they are never silently re-attached to the root),
+* rewrites the table in a single transaction, moving rows through
+  collision-proof temporary paths so the unique constraint on ``path`` is
+  never violated by intermediate states,
+* recomputes ``depth`` and ``numchild`` and verifies them against the
+  database before committing.
+
+After a failure the table is either fully in the old or fully in the new
+encoding; :func:`~treebeard.mp_recode.check_encoding` can be run repeatedly
+with either parameter set to determine the state, and the migration can
+simply be re-executed. A management command wrapper is also available:
+
+.. code-block:: console
+
+   $ python manage.py recode_mp_tree app_label.MyNodeModel \
+       --old-alphabet 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ --old-steplen 4 \
+       --new-alphabet 0123456789abcdefghijklmnopqrstuvwxyz --new-steplen 6
+   $ python manage.py recode_mp_tree app_label.MyNodeModel \
+       --old-alphabet 0123456789abcdefghijklmnopqrstuvwxyz --old-steplen 6 --check
+
+.. automodule:: treebeard.mp_recode
+   :members: recode_tree, plan_recode, check_encoding, RecodeError, RecodePlan, RecodeChange
+   :no-index:
+
 Signals
 -------
 

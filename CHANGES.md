@@ -1,5 +1,18 @@
+Unreleased
+----------
+
+- Added `treebeard.mp_recode`, a maintenance-window migration tool that
+  rewrites `MP_Node` paths from an old `alphabet`/`steplen` encoding to a
+  new one without changing primary keys or business fields. It validates
+  the new parameters (alphabet, database collation, per-level capacity,
+  `path.max_length`), aborts on corrupt or orphan rows, rewrites inside a
+  single transaction using collision-proof temporary paths, and recomputes
+  and verifies `depth`/`numchild`. Includes a `recode_mp_tree` management
+  command and a repeatable `check_encoding` validation helper.
+
+
 Release 7.0.2 (Sep 15, 2026)
-----------------------------
+-----------------------------
 
 Treebeard 7.0.2 is a bugfix release.
 
